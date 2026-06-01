@@ -4,23 +4,29 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).parents[2] / "cli"))
 
+from soft_ue_cli import __main__ as main_mod
 from soft_ue_cli.__main__ import (
     _SCRIPTS_DIR,
     _claude_md_section,
     _default_build_and_relaunch_build_timeout,
     _parse_int_list,
     _parse_vector,
+    _wait_for_build_and_relaunch,
     _validate_script_name,
     _wait_for_build_and_relaunch,
     build_parser,
     cmd_add_datatable_row,
+    cmd_apply_widget_tree,
+    cmd_wire_widget_navigation,
     cmd_add_co_group_child,
     cmd_add_co_mesh_option,
     cmd_add_co_node,
@@ -32,9 +38,12 @@ from soft_ue_cli.__main__ import (
     cmd_batch_call,
     cmd_build_and_relaunch,
     cmd_call_function,
+    cmd_capture_pie_screenshot,
     cmd_capture_screenshot,
+    cmd_commands,
     cmd_compile_co,
     cmd_capture_viewport,
+    cmd_compare_umg_screenshot,
     cmd_delete_script,
     cmd_exec_console_command,
     cmd_inspect_anim_instance,
@@ -43,8 +52,10 @@ from soft_ue_cli.__main__ import (
     cmd_inspect_mutable_parameters,
     cmd_inspect_pawn_possession,
     cmd_list_scripts,
+    cmd_pie_session,
     cmd_pie_tick,
     cmd_query_enum,
+    cmd_query_blueprint_graph,
     cmd_query_mpc,
     cmd_query_struct,
     cmd_release_asset_lock,
@@ -58,14 +69,53 @@ from soft_ue_cli.__main__ import (
     cmd_connect_co_pins,
     cmd_create_co_from_spec,
     cmd_query_asset,
+    cmd_set_node_position,
+    cmd_trigger_input,
     cmd_validate_class_path,
     cmd_trigger_live_coding,
-    cmd_set_node_position,
+    cmd_verify_umg_workflow,
     cmd_wire_co_slot_from_table,
 )
 
 
 # -- _parse_vector -------------------------------------------------------------
+
+
+def test_commands_json_prints_command_metadata(capsys):
+    parser = build_parser()
+    args = parser.parse_args(["commands", "--json"])
+
+    cmd_commands(args)
+
+    payload = json.loads(capsys.readouterr().out)
+    names = {entry["name"] for entry in payload["commands"]}
+    assert payload["schema"] == "soft-ue.commands.v1"
+    assert "umg layout" in names
+    assert "compare-umg-layout" not in names
+
+
+def test_commands_include_removed_prints_migration_metadata(capsys):
+    parser = build_parser()
+    args = parser.parse_args(["commands", "--include-removed", "--json"])
+
+    cmd_commands(args)
+
+    payload = json.loads(capsys.readouterr().out)
+    removed = next(entry for entry in payload["commands"] if entry["name"] == "query-blueprint")
+    assert removed["status"] == "removed"
+    assert removed["canonical_command"] == "blueprint inspect"
+
+
+def test_commands_filter_by_category_prints_human_rows(capsys):
+    parser = build_parser()
+    args = parser.parse_args(["commands", "--category", "compare"])
+
+    cmd_commands(args)
+
+    out = capsys.readouterr().out
+    assert "umg layout" in out
+    assert "compare-umg-layout" not in out
+    assert "removed" not in out
 
 
 def test_parse_vector_three_components():
@@ -162,6 +212,22 @@ def test_parser_query_level_defaults():
     args = parser.parse_args(["query-level"])
     assert args.limit == 100
     assert args.components is False
+    assert args.world is None
+
+
+def test_parser_query_level_world():
+    parser = build_parser()
+    args = parser.parse_args(["query-level", "--world", "pie"])
+    assert args.world == "pie"
+
+
+def test_cmd_query_level_forwards_world():
+    parser = build_parser()
+    args = parser.parse_args(["query-level", "--world", "pie", "--search", "BP_Player*"])
+    with patch("soft_ue_cli.__main__._run_tool", return_value={}) as mock_run:
+        with patch("soft_ue_cli.__main__._print_json"):
+            args.func(args)
+    mock_run.assert_called_once_with("query-level", {"limit": 100, "search": "BP_Player*", "world": "pie"})
 
 
 def test_parser_get_logs_defaults():
@@ -202,6 +268,8 @@ def test_parser_build_and_relaunch_flags():
         "--startup-recovery",
         "skip",
         "--remember-startup-recovery",
+        "--startup-marker-timeout",
+        "30",
     ])
     assert args.config == "Debug"
     assert args.skip_relaunch is True
@@ -210,6 +278,18 @@ def test_parser_build_and_relaunch_flags():
     assert args.relaunch_timeout == 180
     assert args.startup_recovery == "skip"
     assert args.remember_startup_recovery is True
+    assert args.startup_marker_timeout == 30
+
+
+def test_cmd_build_and_relaunch_forwards_startup_marker_timeout():
+    parser = build_parser()
+    args = parser.parse_args(["build-and-relaunch", "--startup-marker-timeout", "45"])
+    with patch("soft_ue_cli.__main__.health_check", return_value={"running": True}), patch(
+        "soft_ue_cli.__main__._run_tool", return_value={"success": True}
+    ) as mock_run:
+        with patch("soft_ue_cli.__main__._print_json"):
+            args.func(args)
+    mock_run.assert_called_once_with("build-and-relaunch", {"startup_marker_timeout": 45})
 
 
 def test_parser_wait_for_ready_alias_and_timeout():
@@ -251,7 +331,7 @@ def test_parser_get_logs_follow_args():
 
 def test_parser_inspect_uasset():
     parser = build_parser()
-    args = parser.parse_args(["inspect-uasset", "BP_Player.uasset", "--sections", "summary,properties", "--format", "json"])
+    args = parser.parse_args(["asset", "inspect-file", "BP_Player.uasset", "--sections", "summary,properties", "--format", "json"])
     assert args.file_path == "BP_Player.uasset"
     assert args.sections == "summary,properties"
     assert args.format == "json"
@@ -259,17 +339,35 @@ def test_parser_inspect_uasset():
 
 def test_parser_diff_uasset():
     parser = build_parser()
-    args = parser.parse_args(["diff-uasset", "BP_Old.uasset", "BP_New.uasset", "--sections", "properties"])
+    args = parser.parse_args(["asset", "diff-file", "BP_Old.uasset", "BP_New.uasset", "--sections", "properties"])
     assert args.left_file == "BP_Old.uasset"
     assert args.right_file == "BP_New.uasset"
     assert args.sections == "properties"
 
 
+def test_parser_get_property_world():
+    parser = build_parser()
+    args = parser.parse_args(["get-property", "BP_Player_C_0", "Health", "--world", "pie"])
+    assert args.world == "pie"
+
+
+def test_cmd_get_property_forwards_world():
+    parser = build_parser()
+    args = parser.parse_args(["get-property", "BP_Player_C_0", "Health", "--world", "pie"])
+    with patch("soft_ue_cli.__main__._run_tool", return_value={}) as mock_run:
+        with patch("soft_ue_cli.__main__._print_json"):
+            args.func(args)
+    mock_run.assert_called_once_with(
+        "get-property",
+        {"actor_name": "BP_Player_C_0", "property_name": "Health", "world": "pie"},
+    )
+
+
 def test_parser_call_function_no_args():
     parser = build_parser()
     args = parser.parse_args(["call-function", "BP_Hero", "Jump"])
-    assert args.actor_name == "BP_Hero"
-    assert args.function_name == "Jump"
+    assert args.legacy_actor_name == "BP_Hero"
+    assert args.legacy_function_name == "Jump"
     assert args.args is None
 
 
@@ -329,6 +427,16 @@ def test_cmd_setup_contains_plugin_src(tmp_path, capsys, monkeypatch):
     cmd_setup(args)
     out = capsys.readouterr().out
     assert "/custom/plugin" in out or "custom" in out
+
+
+def test_cmd_setup_warns_to_refresh_source_timestamps(tmp_path, capsys, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    parser = build_parser()
+    args = parser.parse_args(["setup"])
+    cmd_setup(args)
+    out = capsys.readouterr().out
+    assert "Refresh the copied plugin Source timestamps" in out
+    assert "UnrealHeaderTool" in out
 
 
 # -- script management (save / list / delete / run --name) ---------------------
@@ -558,6 +666,53 @@ def test_validate_script_name_slash_exits():
 # -- parser tests for new subcommands ------------------------------------------
 
 
+def test_query_blueprint_graph_parses_recursive_and_node_class_filters():
+    args = build_parser().parse_args([
+        "blueprint",
+        "graph",
+        "inspect",
+        "/Game/Animation/ABP_Player",
+        "--recursive",
+        "--node-class",
+        "AnimGraphNode_StateMachine,AnimGraphNode_BlendStack",
+        "--include-anim-props",
+    ])
+
+    assert args.recursive is True
+    assert args.node_class == "AnimGraphNode_StateMachine,AnimGraphNode_BlendStack"
+
+
+def test_query_blueprint_graph_forwards_recursive_and_node_class_filters():
+    ns = argparse.Namespace(
+        asset_path="/Game/Animation/ABP_Player",
+        node_guid=None,
+        callable_name=None,
+        list_callables=False,
+        graph_name=None,
+        graph_type=None,
+        include_positions=False,
+        search=None,
+        include_anim_props=True,
+        recursive=True,
+        node_class="AnimGraphNode_StateMachine,AnimGraphNode_BlendStack",
+    )
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"graphs": []}) as mock_run, patch(
+        "soft_ue_cli.__main__._print_json"
+    ):
+        cmd_query_blueprint_graph(ns)
+
+    mock_run.assert_called_once_with(
+        "query-blueprint-graph",
+        {
+            "asset_path": "/Game/Animation/ABP_Player",
+            "include_anim_node_properties": True,
+            "recursive": True,
+            "node_class": "AnimGraphNode_StateMachine,AnimGraphNode_BlendStack",
+        },
+    )
+
+
 def test_parser_save_script():
     parser = build_parser()
     args = parser.parse_args(["save-script", "myscript", "--script", "pass"])
@@ -600,13 +755,43 @@ def test_cmd_build_and_relaunch_forwards_args(capsys):
     parser = build_parser()
     args = parser.parse_args(["build-and-relaunch", "--config", "Debug", "--skip-relaunch"])
 
-    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+    with patch("soft_ue_cli.__main__.health_check", return_value={"running": True}), patch(
+        "soft_ue_cli.__main__._run_tool", return_value={"success": True}
+    ) as mock_run:
         cmd_build_and_relaunch(args)
 
     mock_run.assert_called_once_with(
         "build-and-relaunch",
         {"build_config": "Debug", "skip_relaunch": True},
     )
+
+
+def test_wait_for_build_and_relaunch_reads_utf8_bom_status_file(tmp_path, monkeypatch, capsys):
+    status_path = tmp_path / "build_status.json"
+    status_path.write_text('{"success": true}', encoding="utf-8-sig")
+
+    original_read_text = Path.read_text
+
+    def read_text_with_ansi_default_failure(self, *args, **kwargs):
+        if self == status_path and kwargs.get("encoding") is None:
+            raise UnicodeDecodeError("cp949", b"\xef\xbb\xbf", 2, 3, "illegal multibyte sequence")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text_with_ansi_default_failure)
+
+    _wait_for_build_and_relaunch(
+        {
+            "build_status_path": str(status_path),
+            "project": "ExampleProject",
+        },
+        skip_relaunch=True,
+        poll_interval=0.0,
+        build_timeout=0.1,
+    )
+
+    result = json.loads(capsys.readouterr().out)
+    assert result["success"] is True
+    assert result["status"] == "build_succeeded"
 
 
 def test_build_and_relaunch_default_build_timeout_uses_bridge_timeout(monkeypatch):
@@ -631,7 +816,9 @@ def test_cmd_build_and_relaunch_wait_forwards_timeout_overrides():
         "build_log_path": "BuildAndRelaunch.log",
     }
 
-    with patch("soft_ue_cli.__main__._run_tool", return_value=result), patch(
+    with patch("soft_ue_cli.__main__.health_check", return_value={"running": True}), patch(
+        "soft_ue_cli.__main__._run_tool", return_value=result
+    ), patch(
         "soft_ue_cli.__main__._wait_for_build_and_relaunch"
     ) as mock_wait:
         cmd_build_and_relaunch(args)
@@ -644,6 +831,144 @@ def test_cmd_build_and_relaunch_wait_forwards_timeout_overrides():
         build_timeout=12,
         relaunch_timeout=3,
     )
+
+
+def test_parser_build_and_relaunch_offline_fallback_flags():
+    parser = build_parser()
+    args = parser.parse_args([
+        "build-and-relaunch",
+        "--wait",
+        "--project",
+        "D:/Project/Game.uproject",
+        "--editor-exe",
+        "D:/UE/Engine/Binaries/Win64/UnrealEditor.exe",
+        "--build-bat",
+        "D:/UE/Engine/Build/BatchFiles/Build.bat",
+        "--no-offline-fallback",
+    ])
+
+    assert args.project == "D:/Project/Game.uproject"
+    assert args.editor_exe == "D:/UE/Engine/Binaries/Win64/UnrealEditor.exe"
+    assert args.build_bat == "D:/UE/Engine/Build/BatchFiles/Build.bat"
+    assert args.offline_fallback is False
+
+
+def test_cmd_build_and_relaunch_uses_offline_fallback_when_bridge_unavailable(capsys):
+    parser = build_parser()
+    args = parser.parse_args(["build-and-relaunch", "--wait", "--project", "Game.uproject"])
+
+    with patch("soft_ue_cli.__main__.health_check", return_value={"error": "connection refused"}), patch(
+        "soft_ue_cli.__main__._run_offline_build_and_relaunch",
+        return_value={"success": True, "status": "ready"},
+    ) as mock_offline, patch("soft_ue_cli.__main__._run_tool") as mock_run:
+        cmd_build_and_relaunch(args)
+
+    mock_offline.assert_called_once_with(args)
+    mock_run.assert_not_called()
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
+
+
+def test_offline_build_and_relaunch_builds_launches_and_waits(tmp_path, monkeypatch):
+    project = tmp_path / "MyGame.uproject"
+    project.write_text("{}", encoding="utf-8")
+    engine_dir = tmp_path / "UE" / "Engine"
+    build_bat = engine_dir / "Build" / "BatchFiles" / "Build.bat"
+    editor_exe = engine_dir / "Binaries" / "Win64" / "UnrealEditor.exe"
+    build_bat.parent.mkdir(parents=True)
+    editor_exe.parent.mkdir(parents=True)
+    build_bat.write_text("@echo off", encoding="utf-8")
+    editor_exe.write_text("", encoding="utf-8")
+
+    run_calls = []
+    popen_calls = []
+
+    def fake_run(command, **kwargs):
+        run_calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="build ok", stderr="")
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return object()
+
+    health_responses = iter([{"error": "not ready"}, {"running": True}])
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(main_mod.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(main_mod, "health_check", lambda **_kwargs: next(health_responses))
+    monkeypatch.setattr(main_mod.time, "sleep", lambda _seconds: None)
+
+    args = argparse.Namespace(
+        project=str(project),
+        editor_exe=str(editor_exe),
+        build_bat=str(build_bat),
+        config="Debug",
+        wait=True,
+        skip_relaunch=False,
+        build_timeout=30,
+        relaunch_timeout=5,
+    )
+
+    result = main_mod._run_offline_build_and_relaunch(args)
+
+    assert result["success"] is True
+    assert result["status"] == "ready"
+    assert run_calls[0][0][0] == str(build_bat)
+    assert "MyGameEditor" in run_calls[0][0]
+    assert "Debug" in run_calls[0][0]
+    assert f"-Project={project}" in run_calls[0][0]
+    assert popen_calls[0][0] == [str(editor_exe), str(project)]
+
+
+def test_offline_build_discovers_engine_from_uproject_engine_association(tmp_path, monkeypatch):
+    project = tmp_path / "MyGame.uproject"
+    project.write_text('{"EngineAssociation": "5.6"}', encoding="utf-8")
+    program_files = tmp_path / "Program Files"
+    engine_dir = program_files / "Epic Games" / "UE_5.6" / "Engine"
+    build_bat = engine_dir / "Build" / "BatchFiles" / "Build.bat"
+    editor_exe = engine_dir / "Binaries" / "Win64" / "UnrealEditor.exe"
+    build_bat.parent.mkdir(parents=True)
+    editor_exe.parent.mkdir(parents=True)
+    build_bat.write_text("@echo off", encoding="utf-8")
+    editor_exe.write_text("", encoding="utf-8")
+    monkeypatch.setenv("ProgramFiles", str(program_files))
+    monkeypatch.delenv("UNREAL_ENGINE_DIR", raising=False)
+    monkeypatch.delenv("UE_ENGINE_DIR", raising=False)
+
+    args = argparse.Namespace(editor_exe=None, build_bat=None)
+
+    assert main_mod._discover_unreal_build_tools(args, project) == (editor_exe.resolve(), build_bat.resolve())
+
+
+def test_offline_build_and_relaunch_reports_build_failure(tmp_path, monkeypatch):
+    project = tmp_path / "MyGame.uproject"
+    project.write_text("{}", encoding="utf-8")
+    build_bat = tmp_path / "Build.bat"
+    editor_exe = tmp_path / "UnrealEditor.exe"
+    build_bat.write_text("@echo off", encoding="utf-8")
+    editor_exe.write_text("", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 6, stdout="", stderr="compiler error")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(main_mod.subprocess, "Popen", lambda *_args, **_kwargs: pytest.fail("should not launch"))
+
+    args = argparse.Namespace(
+        project=str(project),
+        editor_exe=str(editor_exe),
+        build_bat=str(build_bat),
+        config="Development",
+        wait=True,
+        skip_relaunch=False,
+        build_timeout=30,
+        relaunch_timeout=5,
+    )
+
+    result = main_mod._run_offline_build_and_relaunch(args)
+
+    assert result["success"] is False
+    assert result["status"] == "build_failed"
+    assert result["exit_code"] == 2
+    assert "compiler error" in result["build_output"]
 
 
 def test_cmd_wait_for_ready_returns_when_bridge_health_succeeds(capsys, monkeypatch):
@@ -916,13 +1241,13 @@ def test_cmd_inspect_pawn_possession_forwards_args():
 
 def test_parser_release_asset_lock():
     parser = build_parser()
-    args = parser.parse_args(["release-asset-lock", "/Game/Blueprints/BP_Player"])
+    args = parser.parse_args(["asset", "release-lock", "/Game/Blueprints/BP_Player"])
     assert args.asset_path == "/Game/Blueprints/BP_Player"
 
 
 def test_cmd_release_asset_lock_forwards_args():
     parser = build_parser()
-    args = parser.parse_args(["release-asset-lock", "/Game/Blueprints/BP_Player"])
+    args = parser.parse_args(["asset", "release-lock", "/Game/Blueprints/BP_Player"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         cmd_release_asset_lock(args)
@@ -932,14 +1257,14 @@ def test_cmd_release_asset_lock_forwards_args():
 
 def test_parser_query_asset_pattern_alias():
     parser = build_parser()
-    args = parser.parse_args(["query-asset", "--pattern", "CO_PC_Test", "--class", "CustomizableObject"])
+    args = parser.parse_args(["asset", "query", "--pattern", "CO_PC_Test", "--class", "CustomizableObject"])
     assert args.query == "CO_PC_Test"
     assert args.asset_class == "CustomizableObject"
 
 
 def test_cmd_query_asset_pattern_forwards_query():
     parser = build_parser()
-    args = parser.parse_args(["query-asset", "--pattern", "CO_PC_Test", "--class", "CustomizableObject"])
+    args = parser.parse_args(["asset", "query", "--pattern", "CO_PC_Test", "--class", "CustomizableObject"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         cmd_query_asset(args)
@@ -952,8 +1277,7 @@ def test_cmd_query_asset_pattern_forwards_query():
 
 def test_parser_inspect_customizable_object_graph():
     parser = build_parser()
-    args = parser.parse_args(
-        ["inspect-customizable-object-graph", "/Game/Characters/CO_Hero.CO_Hero", "--include-node-properties"]
+    args = parser.parse_args(["mutable", "inspect", "graph", "/Game/Characters/CO_Hero.CO_Hero", "--include-node-properties"]
     )
     assert args.asset_path == "/Game/Characters/CO_Hero.CO_Hero"
     assert args.include_node_properties is True
@@ -961,8 +1285,7 @@ def test_parser_inspect_customizable_object_graph():
 
 def test_cmd_inspect_customizable_object_graph_forwards_args():
     parser = build_parser()
-    args = parser.parse_args(
-        ["inspect-customizable-object-graph", "/Game/Characters/CO_Hero.CO_Hero", "--include-node-properties"]
+    args = parser.parse_args(["mutable", "inspect", "graph", "/Game/Characters/CO_Hero.CO_Hero", "--include-node-properties"]
     )
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
@@ -976,13 +1299,13 @@ def test_cmd_inspect_customizable_object_graph_forwards_args():
 
 def test_parser_inspect_mutable_parameters():
     parser = build_parser()
-    args = parser.parse_args(["inspect-mutable-parameters", "/Game/Characters/CO_Hero.CO_Hero"])
+    args = parser.parse_args(["mutable", "inspect", "parameters", "/Game/Characters/CO_Hero.CO_Hero"])
     assert args.asset_path == "/Game/Characters/CO_Hero.CO_Hero"
 
 
 def test_cmd_inspect_mutable_parameters_forwards_args():
     parser = build_parser()
-    args = parser.parse_args(["inspect-mutable-parameters", "/Game/Characters/CO_Hero.CO_Hero"])
+    args = parser.parse_args(["mutable", "inspect", "parameters", "/Game/Characters/CO_Hero.CO_Hero"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         cmd_inspect_mutable_parameters(args)
@@ -995,13 +1318,13 @@ def test_cmd_inspect_mutable_parameters_forwards_args():
 
 def test_parser_inspect_mutable_diagnostics():
     parser = build_parser()
-    args = parser.parse_args(["inspect-mutable-diagnostics", "/Game/Characters/CO_Hero.CO_Hero"])
+    args = parser.parse_args(["mutable", "inspect", "diagnostics", "/Game/Characters/CO_Hero.CO_Hero"])
     assert args.asset_path == "/Game/Characters/CO_Hero.CO_Hero"
 
 
 def test_cmd_inspect_mutable_diagnostics_forwards_args():
     parser = build_parser()
-    args = parser.parse_args(["inspect-mutable-diagnostics", "/Game/Characters/CO_Hero.CO_Hero"])
+    args = parser.parse_args(["mutable", "inspect", "diagnostics", "/Game/Characters/CO_Hero.CO_Hero"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         cmd_inspect_mutable_diagnostics(args)
@@ -1014,9 +1337,7 @@ def test_cmd_inspect_mutable_diagnostics_forwards_args():
 
 def test_cmd_add_co_node_forwards_generic_node_args():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "add-co-node",
+    args = parser.parse_args(["mutable", "graph", "add-node",
             "/Game/Characters/CO_Hero.CO_Hero",
             "CustomizableObjectNodeFloatParameter",
             "--graph-name",
@@ -1045,9 +1366,7 @@ def test_cmd_add_co_node_forwards_generic_node_args():
 
 def test_cmd_add_co_parameter_defaults_node_class_and_parameter_name():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "add-co-parameter",
+    args = parser.parse_args(["mutable", "graph", "add-parameter",
             "/Game/Characters/CO_Hero.CO_Hero",
             "BodyHeight",
             "--parameter-type",
@@ -1070,9 +1389,7 @@ def test_cmd_add_co_parameter_defaults_node_class_and_parameter_name():
 
 def test_cmd_add_co_mesh_option_forwards_mesh_property():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "add-co-mesh-option",
+    args = parser.parse_args(["mutable", "graph", "add-mesh-option",
             "/Game/Characters/CO_Hero.CO_Hero",
             "/Game/Meshes/SKM_Boots.SKM_Boots",
             "--position",
@@ -1096,9 +1413,7 @@ def test_cmd_add_co_mesh_option_forwards_mesh_property():
 
 def test_cmd_set_co_base_mesh_forwards_node_property():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "set-co-base-mesh",
+    args = parser.parse_args(["mutable", "graph", "set-base-mesh",
             "/Game/Characters/CO_Hero.CO_Hero",
             "node-guid-1",
             "/Game/Meshes/SKM_Base.SKM_Base",
@@ -1120,9 +1435,7 @@ def test_cmd_set_co_base_mesh_forwards_node_property():
 
 def test_cmd_add_co_group_child_forwards_pin_connection():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "add-co-group-child",
+    args = parser.parse_args(["mutable", "graph", "add-group-child",
             "/Game/Characters/CO_Hero.CO_Hero",
             "group-node",
             "child-node",
@@ -1150,9 +1463,7 @@ def test_cmd_add_co_group_child_forwards_pin_connection():
 
 def test_cmd_set_co_node_property_forwards_json_properties():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "set-co-node-property",
+    args = parser.parse_args(["mutable", "graph", "set-node-property",
             "/Game/Characters/CO_Hero.CO_Hero",
             "node-guid-1",
             "--properties",
@@ -1175,9 +1486,7 @@ def test_cmd_set_co_node_property_forwards_json_properties():
 
 def test_cmd_connect_co_pins_forwards_connection():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "connect-co-pins",
+    args = parser.parse_args(["mutable", "graph", "connect-pins",
             "/Game/Characters/CO_Hero.CO_Hero",
             "source-node",
             "Value",
@@ -1204,9 +1513,7 @@ def test_cmd_connect_co_pins_forwards_connection():
 
 def test_cmd_connect_co_pins_can_disable_auto_regenerate():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "connect-co-pins",
+    args = parser.parse_args(["mutable", "graph", "connect-pins",
             "/Game/Characters/CO_Hero.CO_Hero",
             "source-node",
             "Value",
@@ -1236,7 +1543,7 @@ def test_cmd_regenerate_co_node_pins_forwards_node_reference():
     from soft_ue_cli import __main__ as main_mod
 
     parser = build_parser()
-    args = parser.parse_args(["regenerate-co-node-pins", "/Game/Characters/CO_Hero.CO_Hero", "node-guid-1"])
+    args = parser.parse_args(["mutable", "graph", "regenerate-node-pins", "/Game/Characters/CO_Hero.CO_Hero", "node-guid-1"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         main_mod.cmd_regenerate_co_node_pins(args)
@@ -1249,7 +1556,7 @@ def test_cmd_regenerate_co_node_pins_forwards_node_reference():
 
 def test_cmd_compile_co_forwards_asset_path():
     parser = build_parser()
-    args = parser.parse_args(["compile-co", "/Game/Characters/CO_Hero.CO_Hero"])
+    args = parser.parse_args(["mutable", "compile", "/Game/Characters/CO_Hero.CO_Hero"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         cmd_compile_co(args)
@@ -1262,7 +1569,7 @@ def test_cmd_compile_co_forwards_asset_path():
 
 def test_cmd_compile_co_gather_references_forwards_flag():
     parser = build_parser()
-    args = parser.parse_args(["compile-co", "/Game/Characters/CO_Hero.CO_Hero", "--gather-references"])
+    args = parser.parse_args(["mutable", "compile", "/Game/Characters/CO_Hero.CO_Hero", "--gather-references"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         cmd_compile_co(args)
@@ -1275,9 +1582,7 @@ def test_cmd_compile_co_gather_references_forwards_flag():
 
 def test_cmd_create_co_from_spec_forwards_json_spec():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "create-co-from-spec",
+    args = parser.parse_args(["mutable", "graph", "create-from-spec",
             "/Game/Characters/CO_Hero.CO_Hero",
             "--spec",
             '{"nodes":[{"id":"mesh","class":"CustomizableObjectNodeSkeletalMesh"}],"edges":[]}',
@@ -1301,9 +1606,7 @@ def test_cmd_create_co_from_spec_forwards_json_spec():
 
 def test_cmd_set_node_position_forwards_positions_for_customizable_object_paths():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "set-node-position",
+    args = parser.parse_args(["blueprint", "node", "position",
             "/Game/Characters/CO_Hero.CO_Hero",
             "--positions",
             '[{"guid":"11111111-2222-3333-4444-555555555555","x":120,"y":240}]',
@@ -1326,7 +1629,7 @@ def test_cmd_remove_co_node_forwards_node_reference():
     from soft_ue_cli import __main__ as main_mod
 
     parser = build_parser()
-    args = parser.parse_args(["remove-co-node", "/Game/Characters/CO_Hero.CO_Hero", "node-guid-1"])
+    args = parser.parse_args(["mutable", "graph", "remove-node", "/Game/Characters/CO_Hero.CO_Hero", "node-guid-1"])
 
     with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
         main_mod.cmd_remove_co_node(args)
@@ -1339,9 +1642,7 @@ def test_cmd_remove_co_node_forwards_node_reference():
 
 def test_cmd_wire_co_slot_from_table_forwards_macro_args():
     parser = build_parser()
-    args = parser.parse_args(
-        [
-            "wire-customizable-object-slot-from-table",
+    args = parser.parse_args(["mutable", "graph", "wire-slot-from-table",
             "/Game/Characters/CO_Hero.CO_Hero",
             "Boots",
             "/Game/Data/DT_Equipment.DT_Equipment",
@@ -1419,34 +1720,40 @@ def test_cmd_add_datatable_row_forwards_row_data_as_object():
 
 def test_parser_capture_screenshot_window():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "window"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "window"])
     assert args.mode == "window"
     assert args.func == cmd_capture_screenshot
 
 
 def test_parser_capture_screenshot_tab():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "tab", "--window-name", "Blueprint"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "tab", "--window-name", "Blueprint"])
     assert args.mode == "tab"
     assert args.window_name == "Blueprint"
 
 
 def test_parser_capture_screenshot_region():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "region", "--region", "0,0,800,600"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "region", "--region", "0,0,800,600"])
     assert args.mode == "region"
     assert args.region == "0,0,800,600"
 
 
 def test_parser_capture_screenshot_viewport():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "viewport"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "viewport"])
     assert args.mode == "viewport"
+
+
+def test_parser_capture_screenshot_pie_window():
+    parser = build_parser()
+    args = parser.parse_args(["capture", "screenshot", "--source", "pie-window"])
+    assert args.mode == "pie-window"
 
 
 def test_parser_capture_screenshot_format_and_output():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "window", "--format", "png", "--output", "file"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "window", "--format", "png", "--output", "file"])
     assert args.format == "png"
     assert args.output == "file"
 
@@ -1454,12 +1761,12 @@ def test_parser_capture_screenshot_format_and_output():
 def test_parser_capture_screenshot_invalid_mode():
     parser = build_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["capture-screenshot", "invalid"])
+        parser.parse_args(["capture", "screenshot", "--source", "invalid"])
 
 
 def test_cmd_capture_screenshot_window_calls_tool():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "window"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "window"])
     with patch("soft_ue_cli.__main__.call_tool", return_value={"file_path": "/tmp/shot.png"}) as mock_call:
         cmd_capture_screenshot(args)
     mock_call.assert_called_once_with("capture-screenshot", {"mode": "window"})
@@ -1467,7 +1774,7 @@ def test_cmd_capture_screenshot_window_calls_tool():
 
 def test_cmd_capture_screenshot_tab_calls_tool():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "tab", "--window-name", "OutputLog"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "tab", "--window-name", "OutputLog"])
     with patch("soft_ue_cli.__main__.call_tool", return_value={"file_path": "/tmp/shot.png"}) as mock_call:
         cmd_capture_screenshot(args)
     mock_call.assert_called_once_with(
@@ -1477,7 +1784,7 @@ def test_cmd_capture_screenshot_tab_calls_tool():
 
 def test_cmd_capture_screenshot_region_calls_tool():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "region", "--region", "10,20,800,600"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "region", "--region", "10,20,800,600"])
     with patch("soft_ue_cli.__main__.call_tool", return_value={"file_path": "/tmp/shot.png"}) as mock_call:
         cmd_capture_screenshot(args)
     mock_call.assert_called_once_with(
@@ -1487,7 +1794,7 @@ def test_cmd_capture_screenshot_region_calls_tool():
 
 def test_cmd_capture_screenshot_viewport_calls_tool():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "viewport", "--format", "png"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "viewport", "--format", "png"])
     with patch("soft_ue_cli.__main__.call_tool", return_value={"file_path": "/tmp/shot.png"}) as mock_call:
         cmd_capture_screenshot(args)
     mock_call.assert_called_once_with(
@@ -1495,22 +1802,292 @@ def test_cmd_capture_screenshot_viewport_calls_tool():
     )
 
 
-def test_cmd_capture_screenshot_all_options():
+def test_cmd_capture_screenshot_window_can_opt_out_of_safe_mode():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "window", "--format", "jpeg", "--output", "base64"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "window", "--unsafe-slate-window-capture"])
+    with patch("soft_ue_cli.__main__.call_tool", return_value={"file_path": "/tmp/shot.png"}) as mock_call:
+        cmd_capture_screenshot(args)
+    mock_call.assert_called_once_with(
+        "capture-screenshot", {"mode": "window", "safe_mode": False}
+    )
+
+
+def test_cmd_capture_pie_screenshot_calls_safe_composited_mode():
+    parser = build_parser()
+    args = parser.parse_args(["capture", "screenshot", "--source", "pie-window",
+        "--format",
+        "jpeg",
+        "--output",
+        "base64",
+        "--scale",
+        "70",
+        "--cleanup-previous",
+    ])
+    assert args.func == cmd_capture_screenshot
     with patch("soft_ue_cli.__main__.call_tool", return_value={"image_base64": "..."}) as mock_call:
         cmd_capture_screenshot(args)
     mock_call.assert_called_once_with(
-        "capture-screenshot", {"mode": "window", "format": "jpeg", "output": "base64"}
+        "capture-screenshot",
+        {
+            "mode": "pie-window",
+            "format": "jpeg",
+            "output": "base64",
+            "scale": 70.0,
+            "cleanup_previous": True,
+        },
+    )
+
+
+def test_cmd_capture_screenshot_all_options():
+    parser = build_parser()
+    args = parser.parse_args(["capture", "screenshot", "--source", "window",
+        "--format",
+        "jpeg",
+        "--output",
+        "base64",
+        "--scale",
+        "50",
+        "--color-mode",
+        "grayscale",
+    ])
+    with patch("soft_ue_cli.__main__.call_tool", return_value={"image_base64": "..."}) as mock_call:
+        cmd_capture_screenshot(args)
+    mock_call.assert_called_once_with(
+        "capture-screenshot",
+        {
+            "mode": "window",
+            "format": "jpeg",
+            "output": "base64",
+            "scale": 50.0,
+            "color_mode": "grayscale",
+        },
     )
 
 
 def test_cmd_capture_screenshot_invalid_region_exits():
     parser = build_parser()
-    args = parser.parse_args(["capture-screenshot", "region", "--region", "a,b,c,d"])
+    args = parser.parse_args(["capture", "screenshot", "--source", "region", "--region", "a,b,c,d"])
     with pytest.raises(SystemExit) as exc:
         cmd_capture_screenshot(args)
     assert exc.value.code == 1
+
+
+def test_cmd_compare_umg_screenshot_outputs_structured_result(tmp_path, capsys):
+    from PIL import Image
+
+    reference = tmp_path / "reference.png"
+    captured = tmp_path / "captured.png"
+    annotated = tmp_path / "annotated.png"
+    Image.new("RGB", (8, 8), (20, 40, 80)).save(reference)
+    Image.new("RGB", (8, 8), (24, 42, 78)).save(captured)
+
+    parser = build_parser()
+    args = parser.parse_args(["umg", "layout", "compare", "--mode", "pixel",
+        str(reference),
+        str(captured),
+        "--annotated-output",
+        str(annotated),
+    ])
+    assert args.func == main_mod.cmd_umg_layout
+
+    main_mod.cmd_umg_layout(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["success"] is True
+    assert 0.95 <= data["similarity_score"] <= 1.0
+    assert data["layout_regions"]
+    assert "element_presence_delta" in data
+    assert data["annotated_diff_path"] == str(annotated)
+    assert annotated.exists()
+
+
+def test_cmd_compare_umg_screenshot_accepts_mcp_array_crop(tmp_path, capsys):
+    from PIL import Image
+
+    reference = tmp_path / "reference.png"
+    captured = tmp_path / "captured.png"
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(reference)
+    Image.new("RGB", (8, 8), (10, 20, 30)).save(captured)
+    args = argparse.Namespace(
+        reference_image=str(reference),
+        captured_image=str(captured),
+        crop=[0, 0, 4, 4],
+        annotated_output=None,
+        threshold=0.9,
+    )
+
+    cmd_compare_umg_screenshot(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["captured"]["crop"] == [0, 0, 4, 4]
+    assert data["similarity_score"] == 1.0
+
+
+def test_cmd_compare_umg_layout_outputs_structured_deltas(tmp_path, capsys):
+    expected = tmp_path / "expected.json"
+    actual = tmp_path / "actual.json"
+    expected.write_text(json.dumps({"widgets": [{"name": "A", "normalized_bounds": [0, 0, 1, 1]}]}), encoding="utf-8")
+    actual.write_text(json.dumps({"widgets": [{"name": "A", "normalized_bounds": [0.1, 0, 1, 1]}]}), encoding="utf-8")
+
+    parser = build_parser()
+    args = parser.parse_args(["umg", "layout", "compare", "--mode", "geometry",
+        str(expected),
+        str(actual),
+        "--bounds-tolerance",
+        "0.01",
+    ])
+
+    assert hasattr(main_mod, "cmd_compare_umg_layout")
+    main_mod.cmd_compare_umg_layout(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["success"] is False
+    assert data["deltas"][0]["kind"] == "bounds"
+
+
+def test_cmd_extract_umg_layout_forwards_designer_request():
+    parser = build_parser()
+    args = parser.parse_args(["umg", "layout", "extract", "--source",
+        "designer",
+        "--asset-path",
+        "/Game/UI/WBP_Menu",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"widgets": []}) as mock_run:
+        assert hasattr(main_mod, "cmd_extract_umg_layout")
+        main_mod.cmd_extract_umg_layout(args)
+
+    mock_run.assert_called_once_with(
+        "inspect-widget-blueprint",
+        {
+            "asset_path": "/Game/UI/WBP_Menu",
+            "include_defaults": True,
+            "depth_limit": 12,
+        },
+    )
+
+
+def test_cmd_umg_layout_extract_designer_wraps_existing_extraction():
+    parser = build_parser()
+    args = parser.parse_args(["umg", "layout",
+        "extract",
+        "--source",
+        "designer",
+        "--asset-path",
+        "/Game/UI/WBP_Menu",
+    ])
+
+    assert args.func == main_mod.cmd_umg_layout
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"widgets": []}) as mock_run:
+        main_mod.cmd_umg_layout(args)
+
+    mock_run.assert_called_once_with(
+        "inspect-widget-blueprint",
+        {
+            "asset_path": "/Game/UI/WBP_Menu",
+            "include_defaults": True,
+            "depth_limit": 12,
+        },
+    )
+
+
+def test_cmd_umg_layout_compare_geometry_supports_subset(tmp_path, capsys):
+    expected = tmp_path / "expected.json"
+    actual = tmp_path / "actual.json"
+    expected.write_text(json.dumps({"widgets": [{"name": "A", "normalized_bounds": [0, 0, 1, 1]}]}), encoding="utf-8")
+    actual.write_text(
+        json.dumps(
+            {
+                "widgets": [
+                    {"name": "A", "normalized_bounds": [0, 0, 1, 1]},
+                    {"name": "Decor", "normalized_bounds": [0.5, 0.5, 0.1, 0.1]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = build_parser().parse_args(["umg", "layout",
+        "compare",
+        "--mode",
+        "geometry",
+        "--subset",
+        str(expected),
+        str(actual),
+    ])
+    main_mod.cmd_umg_layout(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["success"] is True
+    assert data["summary"]["ignored_extra_widgets"] == 1
+
+
+def test_cmd_umg_layout_fit_writes_corrected_spec(tmp_path, capsys):
+    concept = tmp_path / "concept.json"
+    actual = tmp_path / "actual.json"
+    spec = tmp_path / "spec.json"
+    output = tmp_path / "corrected.json"
+    concept.write_text(
+        json.dumps({"canvas_size": [100, 100], "widgets": [{"name": "A", "bounds": [20, 10, 30, 10]}]}),
+        encoding="utf-8",
+    )
+    actual.write_text(
+        json.dumps({"canvas_size": [100, 100], "widgets": [{"name": "A", "bounds": [10, 10, 30, 10]}]}),
+        encoding="utf-8",
+    )
+    spec.write_text(
+        json.dumps({"root": {"class": "CanvasPanel", "name": "Root", "children": [{"class": "TextBlock", "name": "A", "slot": {"position": [10, 10], "size": [30, 10]}}]}}),
+        encoding="utf-8",
+    )
+
+    args = build_parser().parse_args(["umg", "layout",
+        "fit",
+        "--concept",
+        str(concept),
+        "--actual",
+        str(actual),
+        "--spec",
+        str(spec),
+        "--output",
+        str(output),
+    ])
+    main_mod.cmd_umg_layout(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["success"] is True
+    assert data["corrections"][0]["widget"] == "A"
+    assert json.loads(output.read_text(encoding="utf-8"))["root"]["children"][0]["slot"]["position"] == [20, 10]
+
+
+def test_cmd_umg_layout_compare_both_combines_geometry_and_pixel(tmp_path, capsys):
+    from PIL import Image
+
+    expected = tmp_path / "expected.json"
+    actual = tmp_path / "actual.json"
+    reference = tmp_path / "reference.png"
+    captured = tmp_path / "captured.png"
+    expected.write_text(json.dumps({"widgets": [{"name": "A", "normalized_bounds": [0, 0, 1, 1]}]}), encoding="utf-8")
+    actual.write_text(json.dumps({"widgets": [{"name": "A", "normalized_bounds": [0, 0, 1, 1]}]}), encoding="utf-8")
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(reference)
+    Image.new("RGB", (4, 4), (10, 20, 30)).save(captured)
+
+    args = build_parser().parse_args(["umg", "layout",
+        "compare",
+        "--mode",
+        "both",
+        str(expected),
+        str(actual),
+        "--reference-image",
+        str(reference),
+        "--captured-image",
+        str(captured),
+    ])
+    main_mod.cmd_umg_layout(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["success"] is True
+    assert data["geometry"]["success"] is True
+    assert data["pixel"]["success"] is True
 
 
 # -- capture-viewport parser & cmd ---------------------------------------------
@@ -1518,7 +2095,7 @@ def test_cmd_capture_screenshot_invalid_region_exits():
 
 def test_parser_capture_viewport_defaults():
     parser = build_parser()
-    args = parser.parse_args(["capture-viewport"])
+    args = parser.parse_args(["capture", "viewport"])
     assert args.func == cmd_capture_viewport
     assert args.format is None
     assert args.output is None
@@ -1526,14 +2103,33 @@ def test_parser_capture_viewport_defaults():
 
 def test_parser_capture_viewport_with_options():
     parser = build_parser()
-    args = parser.parse_args(["capture-viewport", "--format", "jpeg", "--output", "base64"])
+    args = parser.parse_args(["capture", "viewport",
+        "--format",
+        "jpeg",
+        "--output",
+        "base64",
+        "--scale",
+        "50",
+        "--width",
+        "640",
+        "--height",
+        "360",
+        "--color-mode",
+        "monochrome",
+        "--cleanup-previous",
+    ])
     assert args.format == "jpeg"
     assert args.output == "base64"
+    assert args.scale == 50.0
+    assert args.width == 640
+    assert args.height == 360
+    assert args.color_mode == "monochrome"
+    assert args.cleanup_previous is True
 
 
 def test_cmd_capture_viewport_default():
     parser = build_parser()
-    args = parser.parse_args(["capture-viewport"])
+    args = parser.parse_args(["capture", "viewport"])
     with patch("soft_ue_cli.__main__.call_tool", return_value={"file_path": "/tmp/vp.png"}) as mock_call:
         cmd_capture_viewport(args)
     mock_call.assert_called_once_with("capture-viewport", {})
@@ -1541,7 +2137,7 @@ def test_cmd_capture_viewport_default():
 
 def test_cmd_capture_viewport_with_format():
     parser = build_parser()
-    args = parser.parse_args(["capture-viewport", "--format", "png"])
+    args = parser.parse_args(["capture", "viewport", "--format", "png"])
     with patch("soft_ue_cli.__main__.call_tool", return_value={"file_path": "/tmp/vp.png"}) as mock_call:
         cmd_capture_viewport(args)
     mock_call.assert_called_once_with("capture-viewport", {"format": "png"})
@@ -1549,10 +2145,300 @@ def test_cmd_capture_viewport_with_format():
 
 def test_cmd_capture_viewport_all_options():
     parser = build_parser()
-    args = parser.parse_args(["capture-viewport", "--format", "jpeg", "--output", "base64"])
+    args = parser.parse_args(["capture", "viewport",
+        "--format",
+        "jpeg",
+        "--output",
+        "base64",
+        "--scale",
+        "50",
+        "--width",
+        "640",
+        "--height",
+        "360",
+        "--color-mode",
+        "grayscale",
+        "--cleanup-previous",
+    ])
     with patch("soft_ue_cli.__main__.call_tool", return_value={"image_base64": "..."}) as mock_call:
         cmd_capture_viewport(args)
-    mock_call.assert_called_once_with("capture-viewport", {"format": "jpeg", "output": "base64"})
+    mock_call.assert_called_once_with(
+        "capture-viewport",
+        {
+            "format": "jpeg",
+            "output": "base64",
+            "scale": 50.0,
+            "width": 640,
+            "height": 360,
+            "color_mode": "grayscale",
+            "cleanup_previous": True,
+        },
+    )
+
+
+def test_capture_viewport_family_routes_to_existing_tool():
+    parser = build_parser()
+    args = parser.parse_args([
+        "capture",
+        "viewport",
+        "--source",
+        "editor",
+        "--format",
+        "jpeg",
+        "--scale",
+        "50",
+        "--color-mode",
+        "grayscale",
+    ])
+
+    assert args.func == cmd_capture_viewport
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"file_path": "/tmp/vp.jpg"}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "capture-viewport",
+        {
+            "source": "editor",
+            "format": "jpeg",
+            "scale": 50.0,
+            "color_mode": "grayscale",
+        },
+    )
+
+
+def test_capture_screenshot_family_routes_to_existing_tool():
+    parser = build_parser()
+    args = parser.parse_args([
+        "capture",
+        "screenshot",
+        "--source",
+        "pie-window",
+        "--output",
+        "base64",
+        "--width",
+        "640",
+    ])
+
+    assert args.func == cmd_capture_screenshot
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"image_base64": "..."}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "capture-screenshot",
+        {
+            "mode": "pie-window",
+            "output": "base64",
+            "width": 640,
+        },
+    )
+
+
+def test_capture_screenshot_family_region_uses_region_arg():
+    parser = build_parser()
+    args = parser.parse_args([
+        "capture",
+        "screenshot",
+        "--source",
+        "region",
+        "--region",
+        "10,20,800,600",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"file_path": "/tmp/region.png"}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "capture-screenshot",
+        {
+            "mode": "region",
+            "region": [10, 20, 800, 600],
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_attrs"),
+    [
+        (["mutable", "inspect", "graph", "/Game/Characters/CO_Hero.CO_Hero"], {"command": "mutable", "mutable_action": "inspect", "mutable_inspect_action": "graph"}),
+        (["mutable", "graph", "add-node", "/Game/Characters/CO_Hero.CO_Hero", "CustomizableObjectNodeFloatParameter"], {"command": "mutable", "mutable_action": "graph", "mutable_graph_action": "add-node"}),
+        (["mutable", "compile", "/Game/Characters/CO_Hero.CO_Hero"], {"command": "mutable", "mutable_action": "compile"}),
+        (["statetree", "inspect", "/Game/AI/ST_Enemy"], {"command": "statetree", "statetree_action": "inspect"}),
+        (["anim", "rewind", "status"], {"command": "anim", "anim_action": "rewind", "anim_rewind_action": "status"}),
+        (["asset", "query", "--asset-path", "/Game/Data/DT_Items"], {"command": "asset", "asset_action": "query"}),
+        (["asset", "inspect-file", "C:/Project/Content/BP_Player.uasset"], {"command": "asset", "asset_action": "inspect-file"}),
+        (["blueprint", "inspect", "/Game/Blueprints/BP_Player"], {"command": "blueprint", "blueprint_action": "inspect"}),
+        (["blueprint", "graph", "inspect", "/Game/Blueprints/BP_Player"], {"command": "blueprint", "blueprint_action": "graph", "blueprint_graph_action": "inspect"}),
+        (["blueprint", "node", "add", "/Game/Blueprints/BP_Player", "K2Node_CallFunction"], {"command": "blueprint", "blueprint_action": "node", "blueprint_node_action": "add"}),
+    ],
+)
+def test_canonical_command_families_parse_as_canonical_commands(argv, expected_attrs):
+    args = build_parser().parse_args(argv)
+
+    for attr, expected in expected_attrs.items():
+        assert getattr(args, attr) == expected
+
+
+@pytest.mark.parametrize("argv", [
+    ["query-blueprint", "/Game/Blueprints/BP_Player"],
+    ["query-blueprint-graph", "/Game/Blueprints/BP_Player"],
+    ["inspect-customizable-object-graph", "/Game/Characters/CO_Hero.CO_Hero"],
+    ["capture-viewport"],
+    ["umg-layout", "extract", "--source", "concept-image", "--input", "concept.png"],
+])
+def test_removed_flat_commands_are_no_longer_supported(argv):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(argv)
+
+
+def test_canonical_command_family_normalization_preserves_root_options():
+    args = build_parser().parse_args([
+        "--server",
+        "http://127.0.0.1:8080",
+        "--timeout=45",
+        "blueprint",
+        "graph",
+        "inspect",
+        "/Game/Blueprints/BP_Player",
+    ])
+
+    assert args.server == "http://127.0.0.1:8080"
+    assert args.timeout == 45
+    assert args.command == "blueprint"
+    assert args.blueprint_action == "graph"
+    assert args.blueprint_graph_action == "inspect"
+
+
+def test_mutable_graph_add_node_family_routes_to_existing_tool():
+    args = build_parser().parse_args([
+        "mutable",
+        "graph",
+        "add-node",
+        "/Game/Characters/CO_Hero.CO_Hero",
+        "CustomizableObjectNodeFloatParameter",
+        "--properties",
+        '{"ParameterName":"Height"}',
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "add-customizable-object-node",
+        {
+            "asset_path": "/Game/Characters/CO_Hero.CO_Hero",
+            "node_class": "CustomizableObjectNodeFloatParameter",
+            "properties": {"ParameterName": "Height"},
+        },
+    )
+
+
+def test_statetree_state_add_family_routes_to_existing_tool():
+    args = build_parser().parse_args([
+        "statetree",
+        "state",
+        "add",
+        "/Game/AI/ST_Enemy",
+        "Patrol",
+        "--parent-state",
+        "Combat",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "add-statetree-state",
+        {
+            "asset_path": "/Game/AI/ST_Enemy",
+            "state_name": "Patrol",
+            "parent_state": "Combat",
+        },
+    )
+
+
+def test_anim_rewind_snapshot_family_routes_to_existing_tool():
+    args = build_parser().parse_args([
+        "anim",
+        "rewind",
+        "snapshot",
+        "--actor-tag",
+        "Player",
+        "--time",
+        "1.25",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "rewind-snapshot",
+        {
+            "actor_tag": "Player",
+            "time": 1.25,
+        },
+    )
+
+
+def test_asset_preview_family_routes_to_existing_tool():
+    args = build_parser().parse_args([
+        "asset",
+        "preview",
+        "/Game/Textures/T_Player",
+        "--resolution",
+        "512",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"file_path": "/tmp/preview.png"}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "get-asset-preview",
+        {
+            "asset_path": "/Game/Textures/T_Player",
+            "resolution": 512,
+        },
+    )
+
+
+def test_blueprint_graph_inspect_family_routes_to_existing_tool():
+    args = build_parser().parse_args([
+        "blueprint",
+        "graph",
+        "inspect",
+        "/Game/Blueprints/BP_Player",
+        "--graph-name",
+        "EventGraph",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "query-blueprint-graph",
+        {
+            "asset_path": "/Game/Blueprints/BP_Player",
+            "graph_name": "EventGraph",
+        },
+    )
+
+
+def test_parser_trigger_input_target_accepts_negative_vector_with_space():
+    parser = build_parser()
+    args = parser.parse_args(["trigger-input", "move-to", "--target", "-2000,-4190,88"])
+    assert args.target == "-2000,-4190,88"
+
+
+def test_cmd_trigger_input_forwards_negative_target_vector():
+    parser = build_parser()
+    args = parser.parse_args(["trigger-input", "move-to", "--target", "-2000,-4190,88"])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        cmd_trigger_input(args)
+
+    mock_run.assert_called_once_with(
+        "trigger-input",
+        {"action": "move-to", "target": [-2000.0, -4190.0, 88.0]},
+    )
 
 
 # -- inspect-runtime-widgets ---------------------------------------------------
@@ -1595,13 +2481,371 @@ def test_parser_inspect_runtime_widgets_all_args():
     assert args.root_widget == "WBP_HUD_C_0"
 
 
+# -- apply-widget-tree ---------------------------------------------------------
+
+
+def test_parser_apply_widget_tree_json_spec():
+    parser = build_parser()
+    spec = '{"root":{"class":"CanvasPanel","name":"RootCanvas"}}'
+    args = parser.parse_args(["umg", "designer", "apply",
+        "/Game/UI/WBP_Menu",
+        "--spec",
+        spec,
+        "--compile",
+        "--save",
+        "--checkout",
+    ])
+    assert args.func.__name__ == "cmd_apply_widget_tree"
+    assert args.asset_path == "/Game/UI/WBP_Menu"
+    assert args.spec == spec
+    assert args.spec_file is None
+    assert args.append is False
+    assert args.compile is True
+    assert args.save is True
+    assert args.checkout is True
+
+
+def test_cmd_apply_widget_tree_forwards_spec_file(tmp_path):
+    spec_path = tmp_path / "widget_tree.json"
+    spec_path.write_text(
+        json.dumps({
+            "root": {
+                "class": "CanvasPanel",
+                "name": "RootCanvas",
+                "children": [
+                    {
+                        "class": "TextBlock",
+                        "name": "TitleText",
+                        "text": "Main Menu",
+                        "slot": {"position": [32, 48], "size": [480, 72]},
+                    }
+                ],
+            }
+        }),
+        encoding="utf-8",
+    )
+    parser = build_parser()
+    args = parser.parse_args(["umg", "designer", "apply",
+        "/Game/UI/WBP_Menu",
+        "--spec-file",
+        str(spec_path),
+        "--append",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        cmd_apply_widget_tree(args)
+
+    mock_run.assert_called_once_with(
+        "apply-widget-tree",
+        {
+            "asset_path": "/Game/UI/WBP_Menu",
+            "spec": {
+                "root": {
+                    "class": "CanvasPanel",
+                    "name": "RootCanvas",
+                    "children": [
+                        {
+                            "class": "TextBlock",
+                            "name": "TitleText",
+                            "text": "Main Menu",
+                            "slot": {"position": [32, 48], "size": [480, 72]},
+                        }
+                    ],
+                }
+            },
+            "replace": False,
+        },
+    )
+
+
+def test_cmd_apply_widget_tree_requires_spec_or_file(capsys):
+    parser = build_parser()
+    args = parser.parse_args(["umg", "designer", "apply", "/Game/UI/WBP_Menu"])
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_apply_widget_tree(args)
+
+    assert exc.value.code == 1
+    assert "either --spec or --spec-file is required" in capsys.readouterr().err
+
+
+def test_cmd_wire_widget_navigation_forwards_bindings_file(tmp_path):
+    bindings_path = tmp_path / "navigation.json"
+    bindings_path.write_text(
+        json.dumps([
+            {
+                "button": "StartButton",
+                "mode": "switcher",
+                "switcher": "ScreenSwitcher",
+                "target_index": 1,
+            }
+        ]),
+        encoding="utf-8",
+    )
+    parser = build_parser()
+    args = parser.parse_args(["umg", "navigation", "wire",
+        "/Game/UI/WBP_Menu",
+        "--bindings-file",
+        str(bindings_path),
+        "--compile",
+        "--save",
+        "--checkout",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        cmd_wire_widget_navigation(args)
+
+    mock_run.assert_called_once_with(
+        "wire-widget-navigation",
+        {
+            "asset_path": "/Game/UI/WBP_Menu",
+            "bindings": [
+                {
+                    "button": "StartButton",
+                    "mode": "switcher",
+                    "switcher": "ScreenSwitcher",
+                    "target_index": 1,
+                }
+            ],
+            "compile": True,
+            "save": True,
+            "checkout": True,
+        },
+    )
+
+
+def test_cmd_wire_widget_navigation_forwards_allow_pie():
+    parser = build_parser()
+    args = parser.parse_args(["umg", "navigation", "wire",
+        "/Game/UI/WBP_Menu",
+        "--bindings",
+        '[{"button":"StartButton"}]',
+        "--allow-pie",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        cmd_wire_widget_navigation(args)
+
+    mock_run.assert_called_once_with(
+        "wire-widget-navigation",
+        {
+            "asset_path": "/Game/UI/WBP_Menu",
+            "bindings": [{"button": "StartButton"}],
+            "allow_pie": True,
+        },
+    )
+
+
+def test_cmd_wire_widget_navigation_requires_bindings(capsys):
+    parser = build_parser()
+    args = parser.parse_args(["umg", "navigation", "wire", "/Game/UI/WBP_Menu"])
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_wire_widget_navigation(args)
+
+    assert exc.value.code == 1
+    assert "either --bindings or --bindings-file is required" in capsys.readouterr().err
+
+
+def test_cmd_verify_umg_workflow_forwards_contract_args():
+    clicks = '[{"button":"StartButton","expect_active_index":1,"switcher":"ScreenSwitcher"}]'
+    args = argparse.Namespace(
+        widget_class="/Game/UI/WBP_Menu.WBP_Menu_C",
+        root_widget=None,
+        expected_widgets='["RootCanvas","StartButton","ScreenSwitcher"]',
+        expected_widgets_file=None,
+        expected_text='["Main Menu"]',
+        expected_text_file=None,
+        click_sequence=clicks,
+        click_sequence_file=None,
+        capture_after=True,
+        pie_index=1,
+        remove_preview=True,
+        preview_lifecycle=None,
+        viewport_z_order=None,
+    )
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        cmd_verify_umg_workflow(args)
+
+    mock_run.assert_called_once_with(
+        "verify-umg-workflow",
+        {
+            "widget_class": "/Game/UI/WBP_Menu.WBP_Menu_C",
+            "expected_widgets": ["RootCanvas", "StartButton", "ScreenSwitcher"],
+            "expected_text": ["Main Menu"],
+            "click_sequence": [
+                {
+                    "button": "StartButton",
+                    "expect_active_index": 1,
+                    "switcher": "ScreenSwitcher",
+                }
+            ],
+            "capture_after": True,
+            "pie_index": 1,
+            "remove_preview": True,
+        },
+    )
+
+
+def test_umg_designer_apply_routes_to_apply_widget_tree():
+    parser = build_parser()
+    args = parser.parse_args([
+        "umg",
+        "designer",
+        "apply",
+        "/Game/UI/WBP_Menu",
+        "--spec",
+        '{"root":{"class":"CanvasPanel","name":"RootCanvas"}}',
+        "--compile",
+    ])
+
+    assert args.func == cmd_apply_widget_tree
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "apply-widget-tree",
+        {
+            "asset_path": "/Game/UI/WBP_Menu",
+            "spec": {"root": {"class": "CanvasPanel", "name": "RootCanvas"}},
+            "compile": True,
+        },
+    )
+
+
+def test_umg_navigation_wire_routes_to_wire_widget_navigation():
+    parser = build_parser()
+    args = parser.parse_args([
+        "umg",
+        "navigation",
+        "wire",
+        "/Game/UI/WBP_Menu",
+        "--bindings",
+        '[{"button":"StartButton"}]',
+        "--allow-busy",
+    ])
+
+    assert args.func == cmd_wire_widget_navigation
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "wire-widget-navigation",
+        {
+            "asset_path": "/Game/UI/WBP_Menu",
+            "bindings": [{"button": "StartButton"}],
+            "allow_busy": True,
+        },
+    )
+
+
+def test_umg_layout_compare_routes_to_existing_layout_handler(tmp_path, capsys):
+    expected = tmp_path / "expected.json"
+    actual = tmp_path / "actual.json"
+    expected.write_text(json.dumps({"widgets": [{"name": "A", "normalized_bounds": [0, 0, 1, 1]}]}), encoding="utf-8")
+    actual.write_text(json.dumps({"widgets": [{"name": "A", "normalized_bounds": [0, 0, 1, 1]}]}), encoding="utf-8")
+
+    args = build_parser().parse_args([
+        "umg",
+        "layout",
+        "compare",
+        "--mode",
+        "geometry",
+        str(expected),
+        str(actual),
+    ])
+
+    assert args.func == main_mod.cmd_umg_layout
+    main_mod.cmd_umg_layout(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["success"] is True
+
+
+def test_umg_preview_replace_routes_to_preview_primitive():
+    parser = build_parser()
+    args = parser.parse_args([
+        "umg",
+        "preview",
+        "replace",
+        "--widget-class",
+        "/Game/UI/WBP_Menu.WBP_Menu_C",
+        "--pie-index",
+        "1",
+        "--viewport-z-order",
+        "7",
+        "--capture-after",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "umg-preview-replace",
+        {
+            "widget_class": "/Game/UI/WBP_Menu.WBP_Menu_C",
+            "pie_index": 1,
+            "viewport_z_order": 7,
+            "capture_after": True,
+        },
+    )
+
+
+def test_umg_preview_remove_routes_to_preview_primitive():
+    parser = build_parser()
+    args = parser.parse_args([
+        "umg",
+        "preview",
+        "remove",
+        "--preview-handle",
+        "softue-preview:world:widget:guid",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "umg-preview-remove",
+        {
+            "preview_handle": "softue-preview:world:widget:guid",
+        },
+    )
+
+
+def test_umg_verify_navigation_routes_to_verify_umg_workflow():
+    parser = build_parser()
+    args = parser.parse_args([
+        "umg",
+        "verify",
+        "navigation",
+        "--click-sequence",
+        '[{"button":"StartButton"}]',
+        "--root-widget",
+        "WBP_Menu_C_0",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"success": True}) as mock_run:
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "verify-umg-workflow",
+        {
+            "root_widget": "WBP_Menu_C_0",
+            "click_sequence": [{"button": "StartButton"}],
+        },
+    )
+
+
 # -- set-node-property (issue #28) --------------------------------------------
 
 
 def test_parser_set_node_property_positional_args():
     parser = build_parser()
     args = parser.parse_args([
-        "set-node-property",
+        "blueprint",
+        "node",
+        "property",
         "/Game/ABP_Hero",
         "AABB1122-CCDD-EEFF-0011-223344556677",
         '{"SpringStiffness": 450}',
@@ -1614,7 +2858,9 @@ def test_parser_set_node_property_positional_args():
 def test_parser_set_node_property_alpha():
     parser = build_parser()
     args = parser.parse_args([
-        "set-node-property",
+        "blueprint",
+        "node",
+        "property",
         "/Game/ABP_Hero",
         "GUID-0001",
         '{"Alpha": 0.08}',
@@ -1707,14 +2953,14 @@ def test_cmd_query_mpc_invalid_scalar_value_exits():
 
 def test_parser_save_asset_defaults():
     parser = build_parser()
-    args = parser.parse_args(["save-asset", "/Game/Blueprints/BP_Player"])
+    args = parser.parse_args(["asset", "save", "/Game/Blueprints/BP_Player"])
     assert args.asset_path == "/Game/Blueprints/BP_Player"
     assert args.checkout is False
 
 
 def test_parser_save_asset_checkout_flag():
     parser = build_parser()
-    args = parser.parse_args(["save-asset", "/Game/Blueprints/BP_Player", "--checkout"])
+    args = parser.parse_args(["asset", "save", "/Game/Blueprints/BP_Player", "--checkout"])
     assert args.asset_path == "/Game/Blueprints/BP_Player"
     assert args.checkout is True
 
@@ -1819,8 +3065,7 @@ def test_fix_msys_path_mangling():
 
 def test_cmd_add_graph_node_invalid_position_exits():
     parser = build_parser()
-    args = parser.parse_args([
-        "add-graph-node",
+    args = parser.parse_args(["blueprint", "node", "add",
         "/Game/BP_Player",
         "K2Node_CallFunction",
         "--position", "x,y",
@@ -1835,8 +3080,7 @@ def test_cmd_add_graph_node_invalid_position_exits():
 
 def test_cmd_add_anim_state_machine_calls_tool():
     parser = build_parser()
-    args = parser.parse_args([
-        "add-anim-state-machine",
+    args = parser.parse_args(["anim", "state-machine", "add",
         "/Game/Animation/ABP_Hero",
         "Locomotion",
         "--graph-name", "AnimGraph",
@@ -1861,8 +3105,7 @@ def test_cmd_add_anim_state_machine_calls_tool():
 
 def test_cmd_add_anim_state_calls_tool():
     parser = build_parser()
-    args = parser.parse_args([
-        "add-anim-state",
+    args = parser.parse_args(["anim", "state", "add",
         "/Game/Animation/ABP_Hero",
         "Locomotion",
         "Run",
@@ -1887,8 +3130,7 @@ def test_cmd_add_anim_state_calls_tool():
 
 def test_cmd_add_anim_transition_calls_tool():
     parser = build_parser()
-    args = parser.parse_args([
-        "add-anim-transition",
+    args = parser.parse_args(["anim", "transition", "add",
         "/Game/Animation/ABP_Hero",
         "Locomotion",
         "Idle",
@@ -1985,6 +3227,48 @@ def test_batch_call_rejects_non_array_json():
     assert exc.value.code == 1
 
 
+# -- pie-session ---------------------------------------------------------------
+
+
+def test_pie_session_continue_on_blueprint_compile_errors_forwards_action():
+    args = build_parser().parse_args([
+        "pie-session",
+        "start",
+        "--continue-on-blueprint-compile-errors",
+    ])
+    assert args.func == cmd_pie_session
+
+    with patch("soft_ue_cli.__main__.call_tool", return_value={"state": "starting"}) as mock_call:
+        cmd_pie_session(args)
+
+    mock_call.assert_called_once_with(
+        "pie-session",
+        {"action": "start", "blueprint_error_action": "continue"},
+    )
+
+
+def test_pie_session_blueprint_error_report_preflight_forwards_options():
+    args = build_parser().parse_args([
+        "pie-session",
+        "start",
+        "--blueprint-error-action",
+        "report",
+        "--preflight-blueprints",
+    ])
+
+    with patch("soft_ue_cli.__main__.call_tool", return_value={"state": "blocked_by_blueprint_compile_errors"}) as mock_call:
+        cmd_pie_session(args)
+
+    mock_call.assert_called_once_with(
+        "pie-session",
+        {
+            "action": "start",
+            "blueprint_error_action": "report",
+            "preflight_blueprints": True,
+        },
+    )
+
+
 # -- pie-tick ------------------------------------------------------------------
 
 
@@ -2022,8 +3306,10 @@ def test_pie_tick_forwards_to_run_tool():
 
 
 def test_inspect_anim_instance_parses_required():
-    args = build_parser().parse_args(["inspect-anim-instance", "--actor-tag", "TestCharacter"])
-    assert args.command == "inspect-anim-instance"
+    args = build_parser().parse_args(["anim", "instance", "inspect", "--actor-tag", "TestCharacter"])
+    assert args.command == "anim"
+    assert args.anim_action == "instance"
+    assert args.anim_instance_action == "inspect"
     assert args.actor_tag == "TestCharacter"
     assert args.mesh_component is None
     assert args.include is None
@@ -2031,8 +3317,7 @@ def test_inspect_anim_instance_parses_required():
 
 
 def test_inspect_anim_instance_parses_all_flags():
-    args = build_parser().parse_args([
-        "inspect-anim-instance",
+    args = build_parser().parse_args(["anim", "instance", "inspect",
         "--actor-tag", "TestCharacter",
         "--mesh-component", "CharacterMesh0",
         "--include", "state_machines,montages",
@@ -2046,6 +3331,7 @@ def test_inspect_anim_instance_parses_all_flags():
 def test_inspect_anim_instance_forwards_to_run_tool():
     ns = argparse.Namespace(
         actor_tag="TestCharacter",
+        asset_path=None,
         mesh_component="CharacterMesh0",
         include="state_machines,montages",
         blend_weights="LayerAim",
@@ -2059,6 +3345,102 @@ def test_inspect_anim_instance_forwards_to_run_tool():
             "mesh_component": "CharacterMesh0",
             "include": ["state_machines", "montages"],
             "blend_weights": ["LayerAim"],
+        },
+    )
+
+
+def test_inspect_anim_instance_accepts_asset_path_without_actor_tag():
+    args = build_parser().parse_args(["anim", "instance", "inspect",
+        "--asset-path",
+        "/Game/Animation/ABP_Player",
+        "--include",
+        "topology,sync_groups",
+    ])
+
+    assert args.actor_tag is None
+    assert args.asset_path == "/Game/Animation/ABP_Player"
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={"mode": "asset"}) as mock_run, patch(
+        "soft_ue_cli.__main__._print_json"
+    ):
+        args.func(args)
+
+    mock_run.assert_called_once_with(
+        "inspect-anim-instance",
+        {
+            "asset_path": "/Game/Animation/ABP_Player",
+            "include": ["topology", "sync_groups"],
+        },
+    )
+
+
+def test_inspect_anim_instance_requires_actor_tag_or_asset_path():
+    args = argparse.Namespace(
+        actor_tag=None,
+        asset_path=None,
+        mesh_component=None,
+        include=None,
+        blend_weights=None,
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_inspect_anim_instance(args)
+
+    assert exc.value.code == 1
+
+
+def test_sync_marker_commands_parse_and_forward():
+    parser = build_parser()
+
+    inspect_args = parser.parse_args(["anim", "sync-marker", "inspect", "/Game/Animation/Run"])
+    compare_args = parser.parse_args(["anim", "sync-marker", "compare",
+        "/Game/Animation/Walk",
+        "/Game/Animation/Run",
+        "--marker",
+        "Foot_L",
+    ])
+    add_args = parser.parse_args(["anim", "sync-marker", "add", "/Game/Animation/Run", "Foot_L", "0.25", "--save"])
+    remove_args = parser.parse_args(["anim", "sync-marker", "remove",
+        "/Game/Animation/Run",
+        "Foot_L",
+        "--time",
+        "0.25",
+        "--tolerance",
+        "0.01",
+    ])
+
+    with patch("soft_ue_cli.__main__._run_tool", return_value={}) as mock_run, patch(
+        "soft_ue_cli.__main__._print_json"
+    ):
+        inspect_args.func(inspect_args)
+        compare_args.func(compare_args)
+        add_args.func(add_args)
+        remove_args.func(remove_args)
+
+    assert mock_run.call_args_list[0].args == ("inspect-sync-markers", {"asset_path": "/Game/Animation/Run"})
+    assert mock_run.call_args_list[1].args == (
+        "compare-sync-markers",
+        {
+            "asset_paths": ["/Game/Animation/Walk", "/Game/Animation/Run"],
+            "marker": "Foot_L",
+        },
+    )
+    assert mock_run.call_args_list[2].args == (
+        "add-sync-marker",
+        {
+            "asset_path": "/Game/Animation/Run",
+            "marker": "Foot_L",
+            "time": 0.25,
+            "save": True,
+        },
+    )
+    assert mock_run.call_args_list[3].args == (
+        "remove-sync-marker",
+        {
+            "asset_path": "/Game/Animation/Run",
+            "marker": "Foot_L",
+            "time": 0.25,
+            "tolerance": 0.01,
         },
     )
 

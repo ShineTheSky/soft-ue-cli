@@ -86,10 +86,15 @@
 #include "Tools/Animation/AddAnimStateMachineTool.h"
 #include "Tools/Animation/AddAnimStateTool.h"
 #include "Tools/Animation/AddAnimTransitionTool.h"
+#include "Tools/Animation/AnimSyncMarkerTools.h"
 
 // Widget
+#include "Tools/Widget/ApplyWidgetTreeTool.h"
 #include "Tools/Widget/WidgetBlueprintTool.h"
 #include "Tools/Widget/InspectRuntimeWidgetsTool.h"
+#include "Tools/Widget/WireWidgetNavigationTool.h"
+#include "Tools/Widget/UMGPreviewTool.h"
+#include "Tools/Widget/VerifyUMGWorkflowTool.h"
 
 // Write
 #include "Tools/Write/EditorSpawnActorTool.h"
@@ -131,6 +136,22 @@ void FSoftUEBridgeEditorModule::RegisterAnimationTools()
 	if (!Registry.HasTool(TEXT("add-anim-transition")))
 	{
 		Registry.RegisterToolClass<UAddAnimTransitionTool>();
+	}
+	if (!Registry.HasTool(TEXT("inspect-sync-markers")))
+	{
+		Registry.RegisterToolClass<UInspectSyncMarkersTool>();
+	}
+	if (!Registry.HasTool(TEXT("compare-sync-markers")))
+	{
+		Registry.RegisterToolClass<UCompareSyncMarkersTool>();
+	}
+	if (!Registry.HasTool(TEXT("add-sync-marker")))
+	{
+		Registry.RegisterToolClass<UAddSyncMarkerTool>();
+	}
+	if (!Registry.HasTool(TEXT("remove-sync-marker")))
+	{
+		Registry.RegisterToolClass<URemoveSyncMarkerTool>();
 	}
 
 	UE_LOG(LogSoftUEBridgeEditor, Log, TEXT("Registered deferred animation bridge tools; total tools: %d"), Registry.GetToolCount());
@@ -241,8 +262,15 @@ void FSoftUEBridgeEditorModule::StartupModule()
 		FTickerDelegate::CreateRaw(this, &FSoftUEBridgeEditorModule::RegisterAnimationToolsOnTicker));
 
 	// Widget
+	Registry.RegisterToolClass<UApplyWidgetTreeTool>();
 	Registry.RegisterToolClass<UWidgetBlueprintTool>();
 	Registry.RegisterToolClass<UInspectRuntimeWidgetsTool>();
+	Registry.RegisterToolClass<UWireWidgetNavigationTool>();
+	Registry.RegisterToolClass<UUMGPreviewCreateTool>();
+	Registry.RegisterToolClass<UUMGPreviewReplaceTool>();
+	Registry.RegisterToolClass<UUMGPreviewRemoveTool>();
+	Registry.RegisterToolClass<UUMGPreviewListTool>();
+	Registry.RegisterToolClass<UVerifyUMGWorkflowTool>();
 
 	// Write
 	Registry.RegisterToolClass<UEditorSpawnActorTool>();

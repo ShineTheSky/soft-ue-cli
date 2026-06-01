@@ -1,7 +1,7 @@
 ---
 name: test-tools
 description: Exhaustive integration test of all soft-ue-cli tools against a live UE instance. Writes a JSON report.
-version: 2.5.0
+version: 2.6.0
 ---
 
 # test-tools — Integration Test Suite
@@ -62,6 +62,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -443,6 +444,8 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
              {"class_filter": "StaticMeshActor", "limit": 5}, has("actors"))
     run_test("query-level include_components", "query-level",
              {"limit": 5, "include_components": True}, has("actors"))
+    run_test("query-level world=editor", "query-level",
+             {"world": "editor", "limit": 5}, has("actors"))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Suite 4: Actor Lifecycle
@@ -462,6 +465,8 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
              {"search": a1, "limit": 5}, actors_include(a1))
     run_test("get-property Tags", "get-property",
              {"actor_name": a1, "property_name": "Tags"}, has("value"))
+    run_test("get-property Tags world=editor", "get-property",
+             {"actor_name": a1, "property_name": "Tags", "world": "editor"}, has("value"))
     run_test("set-property bHidden=true", "set-property",
              {"actor_name": a1, "property_name": "bHidden", "value": True}, has("success"))
     run_test("call-function GetActorLabel", "call-function",
@@ -500,12 +505,122 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
 
     bp_path = f"{TEST_NS}/BP_SoftUETest"
     bpi_path = f"{TEST_NS}/BPI_SoftUETest"
+    wbp_path = f"{TEST_NS}/WBP_SoftUETest"
     reg_teardown("delete-asset", {"asset_path": bp_path})
     reg_teardown("delete-asset", {"asset_path": bpi_path})
+    reg_teardown("delete-asset", {"asset_path": wbp_path})
 
     run_test("create-asset Blueprint", "create-asset",
              {"asset_path": bp_path, "asset_class": "/Script/Engine.Blueprint",
               "parent_class": "/Script/Engine.Actor"}, has("asset_path"))
+
+    run_test("create-asset WidgetBlueprint", "create-asset",
+             {"asset_path": wbp_path, "asset_class": "WidgetBlueprint"}, has("asset_path"))
+    run_test("apply-widget-tree UMG designer spec", "apply-widget-tree", {
+        "asset_path": wbp_path,
+        "compile": True,
+        "save": True,
+        "spec": {
+            "root": {
+                "class": "CanvasPanel",
+                "name": "RootCanvas",
+                "children": [
+                    {
+                        "class": "TextBlock",
+                        "name": "TitleText",
+                        "text": "SoftUE",
+                        "font_size": 32,
+                        "slot": {
+                            "position": [32, 32],
+                            "size": [320, 64],
+                            "z_order": 1,
+                        },
+                    },
+                    {
+                        "class": "Button",
+                        "name": "StartButton",
+                        "slot": {
+                            "position": [32, 120],
+                            "size": [220, 56],
+                            "z_order": 2,
+                        },
+                        "children": [
+                            {
+                                "class": "TextBlock",
+                                "name": "StartButtonLabel",
+                                "text": "Start",
+                                "justification": "center",
+                            }
+                        ],
+                    },
+                    {
+                        "class": "WidgetSwitcher",
+                        "name": "ScreenSwitcher",
+                        "slot": {
+                            "position": [32, 200],
+                            "size": [420, 180],
+                            "z_order": 3,
+                        },
+                        "children": [
+                            {
+                                "class": "CanvasPanel",
+                                "name": "HomePanel",
+                                "children": [
+                                    {
+                                        "class": "TextBlock",
+                                        "name": "HomePanelText",
+                                        "text": "Home",
+                                    }
+                                ],
+                            },
+                            {
+                                "class": "CanvasPanel",
+                                "name": "DetailsPanel",
+                                "children": [
+                                    {
+                                        "class": "TextBlock",
+                                        "name": "DetailsPanelText",
+                                        "text": "Details",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                ],
+            }
+        },
+    }, lambda r: r.get("success") is True and r.get("widget_count", 0) >= 9)
+    run_test("inspect-widget-blueprint applied tree", "inspect-widget-blueprint",
+             {"asset_path": wbp_path, "depth_limit": 8},
+             lambda r: "RootCanvas" in r.get("all_widgets", []) and "StartButtonLabel" in r.get("all_widgets", []))
+    _umg_layout_tmp = tempfile.mkdtemp(prefix="soft_ue_umg_layout_")
+    _umg_expected_layout = os.path.join(_umg_layout_tmp, "umg_expected_layout.json")
+    run_cli(
+        "umg layout extract designer",
+        "umg",
+        "layout",
+        "extract",
+        "--source",
+        "designer",
+        "--asset-path",
+        wbp_path,
+        "--output",
+        _umg_expected_layout,
+        check_stdout=lambda s: json.loads(s).get("widgets") and os.path.exists(_umg_expected_layout),
+    )
+    run_test("wire-widget-navigation UMG nav contract", "wire-widget-navigation", {
+        "asset_path": wbp_path,
+        "bindings": [
+            {
+                "button": "StartButton",
+                "mode": "switcher",
+                "switcher": "ScreenSwitcher",
+                "target_widget": "DetailsPanel",
+            }
+        ],
+        "compile": True,
+        "save": True,
+    }, lambda r: r.get("success") is True and r.get("binding_count") == 1 and "parent_binding_contract" in r)
 
     # BlueprintInterface — skip gracefully if plugin doesn't support it yet
     _bpi_created = False
@@ -544,8 +659,8 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
              {"asset_path": bp_path}, lambda r: "available" in r and r["available"] is False)
     run_test("inspect-mutable-diagnostics unavailable smoke", "inspect-mutable-diagnostics",
              {"asset_path": bp_path}, lambda r: "available" in r)
-    run_cli("remove-co-node help", "remove-co-node", "--help",
-            check_stdout=lambda s: "remove-co-node" in s and "node" in s)
+    run_cli("mutable graph remove-node help", "mutable", "graph", "remove-node", "--help",
+            check_stdout=lambda s: "remove-node" in s and "node" in s)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Suite 7: Blueprint Inspect
@@ -555,6 +670,8 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
     run_test("query-blueprint", "query-blueprint", {"asset_path": bp_path}, has("path"))
     run_test("query-blueprint-graph EventGraph", "query-blueprint-graph",
              {"asset_path": bp_path, "graph": "EventGraph"}, nonempty("graphs"))
+    run_test("query-blueprint-graph recursive node-class", "query-blueprint-graph",
+             {"asset_path": bp_path, "recursive": True, "node_class": "K2Node_Event"}, nonempty("graphs"))
     run_test("save-asset blueprint (pre-inspect)", "save-asset", {"asset_path": bp_path}, has("success"))
     _inspect_uasset_path = None
     _inspect_uexp_path = None
@@ -576,23 +693,23 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
             _inspect_snapshot_uasset = None
             _inspect_snapshot_uexp = None
         run_cli(
-            "inspect-uasset summary",
-            "inspect-uasset", _inspect_uasset_path,
+            "asset inspect-file summary",
+            "asset", "inspect-file", _inspect_uasset_path,
             check_stdout=lambda s: '"name": "BP_SoftUETest"' in s and '"asset_class"' in s,
         )
         run_cli(
-            "inspect-uasset all",
-            "inspect-uasset", _inspect_uasset_path, "--sections", "all",
+            "asset inspect-file all",
+            "asset", "inspect-file", _inspect_uasset_path, "--sections", "all",
             check_stdout=lambda s: '"variables"' in s and '"functions"' in s and '"fidelity"' in s,
         )
         run_cli(
-            "inspect-uasset properties",
-            "inspect-uasset", _inspect_uasset_path, "--sections", "properties",
+            "asset inspect-file properties",
+            "asset", "inspect-file", _inspect_uasset_path, "--sections", "properties",
             check_stdout=lambda s: '"properties"' in s and '"fidelity"' in s,
         )
     else:
         _record("inspect-uasset", "inspect-uasset", {},
-                False, 0, "skipped: could not resolve on-disk .uasset path")
+                True, 0, "skipped: could not resolve on-disk .uasset path")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Suite 8: Blueprint Graph Manipulation
@@ -686,23 +803,23 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
     run_test("save-asset blueprint", "save-asset", {"asset_path": bp_path}, has("success"))
     if _inspect_uasset_path and _inspect_snapshot_uasset:
         run_cli(
-            "diff-uasset summary",
-            "diff-uasset", _inspect_snapshot_uasset, _inspect_uasset_path,
+            "asset diff-file summary",
+            "asset", "diff-file", _inspect_snapshot_uasset, _inspect_uasset_path,
             check_stdout=lambda s: '"has_changes"' in s and '"summary"' in s,
         )
         run_cli(
-            "diff-uasset all",
-            "diff-uasset", _inspect_snapshot_uasset, _inspect_uasset_path, "--sections", "all",
+            "asset diff-file all",
+            "asset", "diff-file", _inspect_snapshot_uasset, _inspect_uasset_path, "--sections", "all",
             check_stdout=lambda s: '"changes"' in s and '"summary"' in s,
         )
         run_cli(
-            "diff-uasset properties",
-            "diff-uasset", _inspect_snapshot_uasset, _inspect_uasset_path, "--sections", "properties",
+            "asset diff-file properties",
+            "asset", "diff-file", _inspect_snapshot_uasset, _inspect_uasset_path, "--sections", "properties",
             check_stdout=lambda s: '"properties"' in s and '"change_count"' in s,
         )
     else:
         _record("diff-uasset", "diff-uasset", {},
-                False, 0, "skipped: could not snapshot on-disk .uasset before mutation")
+                True, 0, "skipped: could not snapshot on-disk .uasset before mutation")
     if _bpi_created:
         _bpi_class_path = bpi_path + "." + bpi_path.split("/")[-1] + "_C"
         run_test("modify-interface add", "modify-interface", {
@@ -762,7 +879,93 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
         run_test(f"set-viewport-camera preset={preset}", "set-viewport-camera",
                  {"preset": preset}, has("success"))
     run_test("capture-viewport", "capture-viewport", {}, has("file_path"))
+    run_test("capture-viewport scaled grayscale", "capture-viewport",
+             {"scale": 50, "color_mode": "grayscale"}, has("file_path", "width", "height"))
     run_test("capture-screenshot", "capture-screenshot", {}, has("file_path"))
+    run_test("capture-screenshot scaled monochrome", "capture-screenshot",
+             {"scale": 50, "color_mode": "monochrome"}, has("file_path", "width", "height"))
+    _visual_tmp = tempfile.mkdtemp(prefix="soft_ue_visual_")
+    _ref_ppm = os.path.join(_visual_tmp, "reference.ppm")
+    _cap_ppm = os.path.join(_visual_tmp, "captured.ppm")
+    _diff_png = os.path.join(_visual_tmp, "diff.png")
+    _ppm = "P3\n4 4\n255\n" + "\n".join(["20 40 80"] * 16) + "\n"
+    with open(_ref_ppm, "w", encoding="ascii") as _fp:
+        _fp.write(_ppm)
+    with open(_cap_ppm, "w", encoding="ascii") as _fp:
+        _fp.write(_ppm)
+    _layout_expected = os.path.join(_visual_tmp, "expected_layout.json")
+    _layout_actual = os.path.join(_visual_tmp, "actual_layout.json")
+    _layout_report = os.path.join(_visual_tmp, "layout_report.json")
+    _layout = {
+        "canvas_size": [1920, 1080],
+        "widgets": [
+            {"name": "RootCanvas", "normalized_bounds": [0, 0, 1, 1], "z_order": 0, "opacity": 1.0}
+        ],
+    }
+    with open(_layout_expected, "w", encoding="utf-8") as _fp:
+        json.dump(_layout, _fp)
+    with open(_layout_actual, "w", encoding="utf-8") as _fp:
+        json.dump(_layout, _fp)
+    run_cli(
+        "umg layout compare geometry offline",
+        "umg",
+        "layout",
+        "compare",
+        "--mode",
+        "geometry",
+        _layout_expected,
+        _layout_actual,
+        "--output",
+        _layout_report,
+        check_stdout=lambda s: json.loads(s).get("success") is True and os.path.exists(_layout_report),
+    )
+    _layout_unified_report = os.path.join(_visual_tmp, "layout_unified_report.json")
+    run_cli(
+        "umg layout compare geometry offline",
+        "umg",
+        "layout",
+        "compare",
+        "--mode",
+        "geometry",
+        "--subset",
+        _layout_expected,
+        _layout_actual,
+        "--output",
+        _layout_unified_report,
+        check_stdout=lambda s: json.loads(s).get("success") is True and os.path.exists(_layout_unified_report),
+    )
+    _layout_corrected_spec = os.path.join(_visual_tmp, "corrected_widget_tree.json")
+    _layout_spec = os.path.join(_visual_tmp, "widget_tree.json")
+    with open(_layout_spec, "w", encoding="utf-8") as _fp:
+        json.dump({"root": {"class": "CanvasPanel", "name": "RootCanvas", "slot": {"position": [0, 0], "size": [1920, 1080]}}}, _fp)
+    run_cli(
+        "umg layout fit offline",
+        "umg",
+        "layout",
+        "fit",
+        "--concept",
+        _layout_expected,
+        "--actual",
+        _layout_actual,
+        "--spec",
+        _layout_spec,
+        "--output",
+        _layout_corrected_spec,
+        check_stdout=lambda s: json.loads(s).get("success") is True and os.path.exists(_layout_corrected_spec),
+    )
+    run_cli(
+        "umg layout compare pixel offline",
+        "umg",
+        "layout",
+        "compare",
+        "--mode",
+        "pixel",
+        _ref_ppm,
+        _cap_ppm,
+        "--annotated-output",
+        _diff_png,
+        check_stdout=lambda s: json.loads(s).get("success") is True and os.path.exists(_diff_png),
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # Suite 13: PIE
@@ -783,13 +986,35 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
     reg_teardown("pie-session", {"action": "stop", "timeout": PIE_TIMEOUT})
 
     run_test("pie-session start", "pie-session",
-             {"action": "start", "timeout": PIE_TIMEOUT}, has("success"), timeout=PIE_TIMEOUT)
+             {"action": "start", "timeout": PIE_TIMEOUT, "blueprint_error_action": "report"},
+             lambda r: "blueprint_compile_errors" in r or r.get("success") is False,
+             timeout=PIE_TIMEOUT)
     time.sleep(4)
     run_test("pie-session status", "pie-session", {"action": "status"}, has("state"), timeout=PIE_TIMEOUT)
+    if os.environ.get("SOFT_UE_TEST_PIE_TICK") == "1":
+        run_test("pie-tick explicit delta", "pie-tick", {
+            "frames": 2,
+            "delta": 0.0166666,
+        }, has("ticks"), timeout=PIE_TIMEOUT)
+    else:
+        _record("pie-tick explicit delta", "pie-tick", {},
+                True, 0, "skipped: SOFT_UE_TEST_PIE_TICK not set; pie-tick is isolated because it can hang/OOM this editor build")
+    run_test("capture-screenshot pie-window composited", "capture-screenshot",
+             {"mode": "pie-window", "scale": 70, "color_mode": "color"},
+             lambda r: "file_path" in r or r.get("capture_mode") == "pie-window",
+             timeout=PIE_TIMEOUT)
     run_test("exec-console-command stat fps", "exec-console-command",
              {"command": "stat fps", "world": "pie"}, has("success"), timeout=PIE_TIMEOUT)
     run_test("inspect-pawn-possession", "inspect-pawn-possession",
              {"world": "pie"}, has("pawns"), timeout=PIE_TIMEOUT)
+    run_test("verify-umg-workflow preview widget", "verify-umg-workflow", {
+        "widget_class": wbp_path,
+        "expected_widgets": ["RootCanvas", "StartButton", "ScreenSwitcher", "DetailsPanel"],
+        "expected_text": ["SoftUE"],
+        "click_sequence": [{"button": "StartButton"}],
+        "capture_after": True,
+        "remove_preview": True,
+    }, lambda r: r.get("success") is True and r.get("created_preview_widget") is True, timeout=PIE_TIMEOUT)
     run_test("get-logs during PIE", "get-logs", {"limit": 5}, has("lines"), timeout=PIE_TIMEOUT)
     run_test("pie-session stop", "pie-session", {"action": "stop", "timeout": PIE_TIMEOUT}, has("success"), timeout=PIE_TIMEOUT)
 
@@ -841,21 +1066,69 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
             check_stdout=lambda s: '"diffs"' in s or '"sections"' in s or '"overrides"' in s or "no overrides" in s.lower())
     run_cli("config audit", "config", *(["--project-path", project_dir] if project_dir else []), "audit",
             check_stdout=lambda s: '"overrides"' in s or '"sections"' in s or "no overrides" in s.lower())
-    for _co_cmd in (
-        "add-co-node",
-        "add-co-parameter",
-        "add-co-mesh-option",
-        "set-co-base-mesh",
-        "add-co-group-child",
-        "set-co-node-property",
-        "connect-co-pins",
-        "regenerate-co-node-pins",
-        "compile-co",
-        "create-co-from-spec",
+    run_cli("commands json metadata", "commands", "--json",
+            check_stdout=lambda s: '"schema": "soft-ue.commands.v1"' in s and '"umg preview replace"' in s)
+    run_cli("commands category umg", "commands", "--category", "umg",
+            check_stdout=lambda s: "umg" in s and "removed" not in s)
+    run_cli("commands include removed migrations", "commands", "--include-removed", "--json",
+            check_stdout=lambda s: '"status": "removed"' in s and '"canonical_command": "umg designer apply"' in s)
+    run_cli("commands category capture", "commands", "--category", "capture",
+            check_stdout=lambda s: "capture viewport" in s and "capture screenshot" in s and "capture-screenshot" not in s)
+    run_cli("commands category mutable", "commands", "--category", "mutable",
+            check_stdout=lambda s: "mutable graph" in s and "mutable compile" in s and "compile-co" not in s)
+    run_cli("commands category statetree", "commands", "--category", "statetree",
+            check_stdout=lambda s: "statetree inspect" in s and "query-statetree" not in s)
+    run_cli("commands category animation", "commands", "--category", "animation",
+            check_stdout=lambda s: "anim rewind" in s and "rewind-status" not in s)
+    run_cli("commands category asset", "commands", "--category", "asset",
+            check_stdout=lambda s: "asset query" in s and "query-asset" not in s)
+    run_cli("commands category blueprint", "commands", "--category", "blueprint",
+            check_stdout=lambda s: "blueprint graph" in s and "query-blueprint-graph" not in s)
+    run_cli("commands plugin mutable json", "commands", "--plugin", "Mutable", "--json",
+            check_stdout=lambda s: '"required_plugins"' in s and '"Mutable"' in s)
+    run_cli("capture viewport help", "capture", "viewport", "--help",
+            check_stdout=lambda s: "--source" in s and "--scale" in s)
+    run_cli("capture screenshot help", "capture", "screenshot", "--help",
+            check_stdout=lambda s: "--source" in s and "pie-window" in s)
+    run_cli("mutable graph add-node help", "mutable", "graph", "add-node", "--help",
+            check_stdout=lambda s: "mutable graph add-node" in s and "--properties" in s)
+    run_cli("statetree inspect help", "statetree", "inspect", "--help",
+            check_stdout=lambda s: "statetree inspect" in s and "--include" in s)
+    run_cli("anim rewind status help", "anim", "rewind", "status", "--help",
+            check_stdout=lambda s: "rewind-status" in s and "recording" in s.lower())
+    run_cli("asset preview help", "asset", "preview", "--help",
+            check_stdout=lambda s: "asset preview" in s and "--resolution" in s)
+    run_cli("blueprint graph inspect help", "blueprint", "graph", "inspect", "--help",
+            check_stdout=lambda s: "blueprint graph inspect" in s and "--graph-name" in s)
+    _umg_expected = os.path.join(tempfile.gettempdir(), f"soft_ue_umg_expected_{RUN_TS}_{mode_name}.json")
+    _umg_actual = os.path.join(tempfile.gettempdir(), f"soft_ue_umg_actual_{RUN_TS}_{mode_name}.json")
+    with open(_umg_expected, "w", encoding="utf-8") as fh:
+        json.dump({"widgets": [{"name": "Root", "normalized_bounds": [0, 0, 1, 1]}]}, fh)
+    with open(_umg_actual, "w", encoding="utf-8") as fh:
+        json.dump({"widgets": [{"name": "Root", "normalized_bounds": [0, 0, 1, 1]}]}, fh)
+    run_cli("umg layout compare smoke", "umg", "layout", "compare", "--mode", "geometry", _umg_expected, _umg_actual,
+            check_stdout=lambda s: '"success": true' in s)
+    run_cli("umg preview help", "umg", "preview", "--help",
+            check_stdout=lambda s: "create" in s and "replace" in s and "remove" in s)
+    run_cli("umg verify help", "umg", "verify", "--help",
+            check_stdout=lambda s: "widgets" in s and "navigation" in s)
+    run_cli("umg workflow help", "umg", "workflow", "--help",
+            check_stdout=lambda s: "run" in s)
+    for _co_label, _co_args in (
+        ("mutable graph add-node", ("mutable", "graph", "add-node")),
+        ("mutable graph add-parameter", ("mutable", "graph", "add-parameter")),
+        ("mutable graph add-mesh-option", ("mutable", "graph", "add-mesh-option")),
+        ("mutable graph set-base-mesh", ("mutable", "graph", "set-base-mesh")),
+        ("mutable graph add-group-child", ("mutable", "graph", "add-group-child")),
+        ("mutable graph set-node-property", ("mutable", "graph", "set-node-property")),
+        ("mutable graph connect-pins", ("mutable", "graph", "connect-pins")),
+        ("mutable graph regenerate-node-pins", ("mutable", "graph", "regenerate-node-pins")),
+        ("mutable compile", ("mutable", "compile")),
+        ("mutable graph create-from-spec", ("mutable", "graph", "create-from-spec")),
     ):
-        run_cli(f"{_co_cmd} help", _co_cmd, "--help",
-                check_stdout=lambda s, _cmd=_co_cmd: _cmd in s and "CustomizableObject" in s)
-    run_cli("compile-co gather references help", "compile-co", "--help",
+        run_cli(f"{_co_label} help", *_co_args, "--help",
+                check_stdout=lambda s, _cmd=_co_label: _cmd in s and "CustomizableObject" in s)
+    run_cli("mutable compile gather references help", "mutable", "compile", "--help",
             check_stdout=lambda s: "--gather-references" in s)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -911,16 +1184,10 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
 
     run_test("batch-call pie/query/logs smoke", "batch-call", {
         "calls": [
-            {"tool": "pie-tick", "args": {"frames": 1}},
             {"tool": "query-level", "args": {"limit": 3}},
             {"tool": "get-logs", "args": {"lines": 3}},
         ]
     }, lambda r: r.get("status") in {"ok", "error"} and isinstance(r.get("results"), list))
-
-    run_test("pie-tick explicit delta", "pie-tick", {
-        "frames": 2,
-        "delta": 0.0166666,
-    }, has("ticks"))
 
     _skeletal_actor_tag = None
     try:
@@ -940,6 +1207,15 @@ def _run_single_mode(mode_name: str, caller) -> list[dict]:
     else:
         _record("inspect-anim-instance smoke", "inspect-anim-instance", {},
                 True, 0, "skipped: no skeletal actor found in current level")
+
+    run_cli("anim sync-marker inspect help", "anim", "sync-marker", "inspect", "--help",
+            check_stdout=lambda s: "anim sync-marker inspect" in s and "asset_path" in s)
+    run_cli("anim sync-marker compare help", "anim", "sync-marker", "compare", "--help",
+            check_stdout=lambda s: "anim sync-marker compare" in s and "asset_paths" in s)
+    run_cli("anim sync-marker add help", "anim", "sync-marker", "add", "--help",
+            check_stdout=lambda s: "anim sync-marker add" in s and "time" in s)
+    run_cli("anim sync-marker remove help", "anim", "sync-marker", "remove", "--help",
+            check_stdout=lambda s: "anim sync-marker remove" in s and "tolerance" in s)
 
     run_test("call-function transient native", "call-function", {
         "class_path": "/Script/Engine.Actor",

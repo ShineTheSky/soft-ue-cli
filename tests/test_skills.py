@@ -1,11 +1,13 @@
-"""Tests for cli/soft_ue_cli/skills ??skill discovery and retrieval."""
+"""Tests for cli/soft_ue_cli/skills — skill discovery and retrieval."""
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).parents[2] / "cli"))
 
 from soft_ue_cli.skills import get_skill, list_skills
 from soft_ue_cli.__main__ import build_parser, cmd_skills
@@ -37,6 +39,8 @@ def test_list_skills_contains_blueprint_to_cpp():
     assert "author-anim-state-test" in names
     assert "author-bp-parity-test" in names
     assert "author-invariant-test" in names
+    assert "author-umg-designer" in names
+    assert "author-umg-workflow" in names
 
 
 # -- get_skill -----------------------------------------------------------------
@@ -61,14 +65,36 @@ def test_test_tools_contains_idempotent_teardown_and_insights_stop():
     assert 'encoding="utf-8"' in content
     assert "open test level retry" in content
     assert "save-asset (test level before restore)" in content
-    assert "inspect-uasset summary" in content
-    assert "inspect-uasset properties" in content
+    assert "asset inspect-file summary" in content
+    assert "asset inspect-file properties" in content
     assert "asset_to_disk_path" in content
     assert "project_directory" in content
-    assert "diff-uasset summary" in content
-    assert "diff-uasset properties" in content
+    assert "asset diff-file summary" in content
+    assert "asset diff-file properties" in content
     assert "save-asset blueprint" in content
     assert "shutil.copy2" in content
+    assert "apply-widget-tree UMG designer spec" in content
+    assert "inspect-widget-blueprint applied tree" in content
+    assert "wire-widget-navigation UMG nav contract" in content
+    assert "verify-umg-workflow preview widget" in content
+    assert "commands json metadata" in content
+    assert "commands plugin mutable json" in content
+    assert "commands category capture" in content
+    assert "commands category mutable" in content
+    assert "commands category statetree" in content
+    assert "commands category animation" in content
+    assert "commands category asset" in content
+    assert "commands category blueprint" in content
+    assert "capture viewport help" in content
+    assert "capture screenshot help" in content
+    assert "mutable graph add-node help" in content
+    assert "statetree inspect help" in content
+    assert "anim rewind status help" in content
+    assert "asset preview help" in content
+    assert "blueprint graph inspect help" in content
+    assert "umg layout compare smoke" in content
+    assert "umg preview help" in content
+    assert "umg workflow help" in content
 
 
 def test_test_tools_contains_config_suite():
@@ -153,6 +179,32 @@ def test_authoring_subskills_target_cpp_committed_tests():
     assert "CLI capture is acceptable here as exploration tooling" in parity
     assert "single-property invariant" in invariant
     assert "Source/<Project>Tests/Private/Invariants/TEST_<Slug>.cpp" in invariant
+
+
+def test_author_umg_designer_skill_targets_apply_widget_tree():
+    content = get_skill("author-umg-designer")
+    assert content is not None
+    assert "soft-ue-cli umg designer apply" in content
+    assert "CanvasPanel" in content
+    assert "WidgetSwitcher" in content
+    assert "umg designer inspect" in content
+    assert "region/bounding-box table" in content
+    assert "visual-fidelity checklist" in content
+    assert "1920x1080" in content
+    assert "umg layout compare --mode pixel" in content
+    assert "umg_expected_layout.json" in content
+    assert "placeholder asset manifest" in content
+    assert "umg layout compare" in content
+
+
+def test_author_umg_workflow_skill_targets_navigation_and_runtime_verification():
+    content = get_skill("author-umg-workflow")
+    assert content is not None
+    assert "soft-ue-cli umg designer apply" in content
+    assert "soft-ue-cli umg navigation wire" in content
+    assert "soft-ue-cli umg verify navigation" in content
+    assert "stable widget-name contract" in content
+    assert "click_sequence" in content
 
 
 # -- skill file validation -----------------------------------------------------

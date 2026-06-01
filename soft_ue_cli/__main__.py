@@ -5,12 +5,181 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 from .client import call_tool, health_check
+from .command_aliases import COMMAND_ALIAS_PREFIXES, REMOVED_COMMAND_MIGRATIONS
 from .discovery import get_server_url
+
+
+_VECTOR_ARGUMENT_RE = re.compile(
+    r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+    r"(?:,[+-]?(?:\d+(?:\.\d*)?|\.\d+)){2}$"
+)
+
+
+def _normalize_negative_vector_options(args: list[str] | None) -> list[str] | None:
+    if args is None:
+        return None
+
+    normalized: list[str] = []
+    index = 0
+    while index < len(args):
+        current = args[index]
+        if (
+            current == "--target"
+            and index + 1 < len(args)
+            and _VECTOR_ARGUMENT_RE.match(args[index + 1])
+        ):
+            normalized.append(f"--target={args[index + 1]}")
+            index += 2
+            continue
+        normalized.append(current)
+        index += 1
+    return normalized
+
+
+class SoftUEArgumentParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        normalized_args = _normalize_negative_vector_options(list(sys.argv[1:]) if args is None else list(args))
+        return super().parse_known_args(normalized_args, namespace)
+
+
+def _first_subparsers_action(parser: argparse.ArgumentParser) -> argparse._SubParsersAction | None:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    return None
+
+
+def _add_copied_action(target: argparse.ArgumentParser, action: argparse.Action) -> None:
+    if isinstance(action, argparse._HelpAction | argparse._SubParsersAction):
+        return
+
+    kwargs: dict[str, object] = {}
+    for attr in ("nargs", "const", "default", "type", "choices", "help", "metavar"):
+        value = getattr(action, attr, None)
+        if value is not None and value != argparse.SUPPRESS:
+            kwargs[attr] = value
+    if action.option_strings:
+        kwargs["dest"] = action.dest
+        if action.required:
+            kwargs["required"] = True
+    if isinstance(action, argparse._StoreTrueAction):
+        kwargs["action"] = "store_true"
+        for attr in ("nargs", "const", "type", "choices", "metavar"):
+            kwargs.pop(attr, None)
+    elif isinstance(action, argparse._StoreFalseAction):
+        kwargs["action"] = "store_false"
+        for attr in ("nargs", "const", "type", "choices", "metavar"):
+            kwargs.pop(attr, None)
+    elif isinstance(action, argparse._AppendAction):
+        kwargs["action"] = "append"
+
+    if action.option_strings:
+        target.add_argument(*action.option_strings, **kwargs)
+    else:
+        target.add_argument(action.dest, **kwargs)
+
+
+def _copy_parser_surface(source: argparse.ArgumentParser, target: argparse.ArgumentParser) -> None:
+    for action in source._actions:
+        _add_copied_action(target, action)
+    target.set_defaults(**source._defaults)
+
+
+def _subparser_choice_help(subparsers_action: argparse._SubParsersAction, name: str) -> str:
+    for choice_action in subparsers_action._choices_actions:
+        if choice_action.dest == name:
+            return choice_action.help or name
+    return name
+
+
+def _canonicalize_removed_command_text(text: str | None) -> str | None:
+    if not text:
+        return text
+
+    result = text
+    for removed_name, canonical_command in sorted(
+        REMOVED_COMMAND_MIGRATIONS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        result = result.replace(f"soft-ue-cli {removed_name}", f"soft-ue-cli {canonical_command}")
+        result = result.replace(f"`{removed_name}`", f"`{canonical_command}`")
+        result = re.sub(rf"\b{re.escape(removed_name)}\b", canonical_command, result)
+    return result
+
+
+def _ensure_nested_subparser(
+    parent: argparse.ArgumentParser,
+    path: tuple[str, ...],
+    part: str,
+) -> argparse.ArgumentParser:
+    subparsers_action = _first_subparsers_action(parent)
+    if subparsers_action is None:
+        dest = "_".join(path) + "_action"
+        subparsers_action = parent.add_subparsers(dest=dest, required=True)
+    if part in subparsers_action.choices:
+        return subparsers_action.choices[part]
+
+    command_path = " ".join((*path, part))
+    return subparsers_action.add_parser(
+        part,
+        help=f"Canonical {command_path} command family.",
+        description=f"Canonical {command_path} command family.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+
+def _add_canonical_command_families(subparsers_action: argparse._SubParsersAction) -> None:
+    legacy_parsers = dict(subparsers_action.choices)
+    for prefix, removed_command in sorted(COMMAND_ALIAS_PREFIXES.items()):
+        source = legacy_parsers.get(removed_command)
+        if source is None:
+            continue
+
+        current: argparse.ArgumentParser
+        if prefix[0] in subparsers_action.choices:
+            current = subparsers_action.choices[prefix[0]]
+        else:
+            current = subparsers_action.add_parser(
+                prefix[0],
+                help=f"Canonical {prefix[0]} command family.",
+                description=f"Canonical {prefix[0]} command family.",
+                formatter_class=argparse.RawDescriptionHelpFormatter,
+            )
+
+        for depth, part in enumerate(prefix[1:-1], start=1):
+            current = _ensure_nested_subparser(current, prefix[:depth], part)
+
+        leaf_subparsers = _first_subparsers_action(current)
+        if leaf_subparsers is None:
+            leaf_subparsers = current.add_subparsers(dest="_".join(prefix[:-1]) + "_action", required=True)
+        leaf_name = prefix[-1]
+        if leaf_name in leaf_subparsers.choices:
+            continue
+        leaf = leaf_subparsers.add_parser(
+            leaf_name,
+            help=_canonicalize_removed_command_text(_subparser_choice_help(subparsers_action, removed_command)),
+            description=_canonicalize_removed_command_text(source.description),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        _copy_parser_surface(source, leaf)
+
+
+def _remove_top_level_commands(subparsers_action: argparse._SubParsersAction, names: set[str]) -> None:
+    for name in names:
+        subparsers_action.choices.pop(name, None)
+    subparsers_action._choices_actions = [
+        choice_action
+        for choice_action in subparsers_action._choices_actions
+        if choice_action.dest not in names
+    ]
 
 
 def _fix_msys_asset_path(path: str) -> str:
@@ -62,6 +231,46 @@ def _write_next_to_asset(ue_path: str, save_path: str, content: str, ext: str, f
 
 def _print_json(data: object) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def cmd_commands(args: argparse.Namespace) -> None:
+    from .command_catalog import command_metadata_as_json, filter_command_metadata
+
+    if args.json:
+        payload = command_metadata_as_json(probe=args.probe, include_removed=args.include_removed)
+        entries = payload["commands"]
+        if args.category:
+            entries = [entry for entry in entries if entry["category"] == args.category or args.category in entry["name"].split()]
+        if args.requires_bridge:
+            entries = [entry for entry in entries if entry["requires_bridge"]]
+        if args.plugin:
+            plugin = args.plugin.lower()
+            entries = [
+                entry
+                for entry in entries
+                if any(req["name"].lower() == plugin for req in entry["required_plugins"])
+            ]
+        payload["commands"] = entries
+        _print_json(payload)
+        return
+
+    entries = filter_command_metadata(
+        category=args.category,
+        requires_bridge=True if args.requires_bridge else None,
+        include_removed=args.include_removed,
+        plugin=args.plugin,
+    )
+    print(f"{'Command':<38} {'Layer':<14} {'Category':<12} {'Bridge':<6} {'Status':<14} Canonical")
+    print("-" * 110)
+    for entry in entries:
+        print(
+            f"{entry['name']:<38} "
+            f"{entry['layer']:<14} "
+            f"{entry['category']:<12} "
+            f"{str(entry['requires_bridge']).lower():<6} "
+            f"{entry['status']:<14} "
+            f"{entry['canonical_command']}"
+        )
 
 
 def _run_tool(tool_name: str, arguments: dict) -> dict:
@@ -135,6 +344,40 @@ def _parse_json_object_arg(value: object, flag: str) -> dict:
         print(f"error: {flag} must be a JSON object", file=sys.stderr)
         sys.exit(1)
     return parsed
+
+
+def _parse_json_object_file_arg(value: str, flag: str) -> dict:
+    """Parse a JSON object from a file path."""
+    path = Path(value).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: failed to read {flag}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    return _parse_json_object_arg(text, flag)
+
+
+def _parse_json_array_arg(value: object, flag: str) -> list:
+    """Parse a JSON array argument from CLI text or MCP-native list input."""
+    if isinstance(value, list):
+        return value
+
+    parsed = _parse_json_arg(str(value), flag)
+    if not isinstance(parsed, list):
+        print(f"error: {flag} must be a JSON array", file=sys.stderr)
+        sys.exit(1)
+    return parsed
+
+
+def _parse_json_array_file_arg(value: str, flag: str) -> list:
+    """Parse a JSON array from a file path."""
+    path = Path(value).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"error: failed to read {flag}: {exc}", file=sys.stderr)
+        sys.exit(1)
+    return _parse_json_array_arg(text, flag)
 
 
 def _parse_optional_int_list(value: object | None) -> list[int] | None:
@@ -327,7 +570,7 @@ def cmd_batch_call(args: argparse.Namespace) -> None:
             print("error: --calls-file must contain valid JSON", file=sys.stderr)
             sys.exit(1)
     elif args.calls:
-        calls = _parse_json_arg(args.calls, "--calls")
+        calls = _parse_json_array_arg(args.calls, "--calls")
     else:
         print("error: --calls or --calls-file required", file=sys.stderr)
         sys.exit(1)
@@ -344,6 +587,8 @@ def cmd_batch_call(args: argparse.Namespace) -> None:
 
 def cmd_query_level(args: argparse.Namespace) -> None:
     arguments: dict = {"limit": args.limit}
+    if args.world:
+        arguments["world"] = args.world
     if args.actor_name:
         arguments["actor_name"] = args.actor_name
     if args.class_filter:
@@ -366,16 +611,19 @@ def cmd_query_level(args: argparse.Namespace) -> None:
 
 
 def cmd_call_function(args: argparse.Namespace) -> None:
-    if not args.function_name:
+    actor_name = getattr(args, "actor_name", None) or getattr(args, "legacy_actor_name", None)
+    function_name = getattr(args, "function_name", None) or getattr(args, "legacy_function_name", None)
+
+    if not function_name:
         print("error: function name is required", file=sys.stderr)
         sys.exit(1)
-    if not args.actor_name and not args.class_path:
+    if not actor_name and not args.class_path:
         print("error: provide an actor target or --class-path", file=sys.stderr)
         sys.exit(1)
 
-    arguments: dict = {"function_name": args.function_name}
-    if args.actor_name:
-        arguments["actor_name"] = args.actor_name
+    arguments: dict = {"function_name": function_name}
+    if actor_name:
+        arguments["actor_name"] = actor_name
     if args.class_path:
         arguments["class_path"] = args.class_path
     if args.args:
@@ -419,15 +667,13 @@ def cmd_set_property(args: argparse.Namespace) -> None:
 
 
 def cmd_get_property(args: argparse.Namespace) -> None:
-    _print_json(
-        _run_tool(
-            "get-property",
-            {
-                "actor_name": args.actor_name,
-                "property_name": args.property_name,
-            },
-        )
-    )
+    arguments: dict = {
+        "actor_name": args.actor_name,
+        "property_name": args.property_name,
+    }
+    if args.world:
+        arguments["world"] = args.world
+    _print_json(_run_tool("get-property", arguments))
 
 
 def cmd_get_logs(args: argparse.Namespace) -> None:
@@ -848,6 +1094,10 @@ def cmd_query_blueprint_graph(args: argparse.Namespace) -> None:
         arguments["search"] = args.search
     if args.include_anim_props:
         arguments["include_anim_node_properties"] = True
+    if getattr(args, "recursive", False):
+        arguments["recursive"] = True
+    if getattr(args, "node_class", None):
+        arguments["node_class"] = args.node_class
     _print_json(_run_tool("query-blueprint-graph", arguments))
 
 
@@ -1190,11 +1440,22 @@ def _print_uasset_diff_table(data: dict) -> None:
 
 
 def cmd_build_and_relaunch(args: argparse.Namespace) -> None:
+    if getattr(args, "offline_fallback", True):
+        health = health_check(timeout=2.0)
+        if not _bridge_health_is_ready(health):
+            result = _run_offline_build_and_relaunch(args)
+            _print_json(result)
+            if not result.get("success"):
+                sys.exit(int(result.get("exit_code", 1)))
+            return
+
     arguments: dict = {}
     if args.config:
         arguments["build_config"] = args.config
     if args.skip_relaunch:
         arguments["skip_relaunch"] = True
+    if args.startup_marker_timeout is not None:
+        arguments["startup_marker_timeout"] = args.startup_marker_timeout
     result = _run_tool("build-and-relaunch", arguments)
 
     if not args.wait:
@@ -1211,6 +1472,260 @@ def cmd_build_and_relaunch(args: argparse.Namespace) -> None:
         ),
         relaunch_timeout=args.relaunch_timeout,
     )
+
+
+def _discover_uproject_path(project: str | None) -> Path:
+    if project:
+        project_path = Path(project).expanduser()
+        if not project_path.exists():
+            raise FileNotFoundError(f"project file not found: {project}")
+        if project_path.suffix.lower() != ".uproject":
+            raise ValueError(f"project must be a .uproject file: {project}")
+        return project_path.resolve()
+
+    candidates = sorted(Path.cwd().glob("*.uproject"))
+    if not candidates:
+        raise FileNotFoundError(
+            "no .uproject file found in the current directory; pass --project <Project.uproject>"
+        )
+    if len(candidates) > 1:
+        raise ValueError("multiple .uproject files found; pass --project <Project.uproject>")
+    return candidates[0].resolve()
+
+
+def _find_engine_dir_from_editor(editor_exe: Path) -> Path | None:
+    parts = editor_exe.parts
+    lowered = [part.lower() for part in parts]
+    for index, part in enumerate(lowered):
+        if part == "engine":
+            return Path(*parts[: index + 1])
+    return None
+
+
+def _read_uproject_engine_association(project_path: Path) -> str | None:
+    try:
+        data = json.loads(project_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    association = data.get("EngineAssociation")
+    return association if isinstance(association, str) and association.strip() else None
+
+
+def _candidate_engine_dirs_from_project(project_path: Path) -> list[Path]:
+    association = _read_uproject_engine_association(project_path)
+    if not association:
+        return []
+
+    candidates: list[Path] = []
+    association_path = Path(association).expanduser()
+    if association_path.is_absolute():
+        candidates.append(association_path / "Engine" if association_path.name.lower() != "engine" else association_path)
+
+    roots: list[Path] = []
+    for env_name in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+        if value := os.environ.get(env_name):
+            roots.append(Path(value) / "Epic Games")
+    roots.extend([
+        Path("C:/Program Files/Epic Games"),
+        Path("D:/Program Files/Epic Games"),
+    ])
+
+    for root in roots:
+        candidates.append(root / f"UE_{association}" / "Engine")
+        candidates.append(root / association / "Engine")
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
+def _discover_unreal_build_tools(args: argparse.Namespace, project_path: Path) -> tuple[Path, Path]:
+    editor_value = getattr(args, "editor_exe", None) or os.environ.get("UNREAL_EDITOR_EXE") or os.environ.get("UE_EDITOR_EXE")
+    build_value = getattr(args, "build_bat", None) or os.environ.get("UNREAL_BUILD_BAT") or os.environ.get("UE_BUILD_BAT")
+    engine_value = os.environ.get("UNREAL_ENGINE_DIR") or os.environ.get("UE_ENGINE_DIR")
+
+    engine_dir: Path | None = Path(engine_value).expanduser() if engine_value else None
+    editor_exe = Path(editor_value).expanduser() if editor_value else None
+    build_bat = Path(build_value).expanduser() if build_value else None
+
+    if engine_dir is None and editor_exe is not None:
+        engine_dir = _find_engine_dir_from_editor(editor_exe)
+    if engine_dir is None:
+        for candidate in _candidate_engine_dirs_from_project(project_path):
+            if candidate.exists():
+                engine_dir = candidate
+                break
+
+    if editor_exe is None and engine_dir is not None:
+        editor_exe = engine_dir / "Binaries" / "Win64" / "UnrealEditor.exe"
+    if build_bat is None and engine_dir is not None:
+        build_bat = engine_dir / "Build" / "BatchFiles" / "Build.bat"
+
+    if editor_exe is None or build_bat is None:
+        raise FileNotFoundError(
+            "could not discover Unreal build tools for offline build-and-relaunch; "
+            "pass --editor-exe and --build-bat, or set UNREAL_ENGINE_DIR"
+        )
+
+    editor_exe = editor_exe.resolve()
+    build_bat = build_bat.resolve()
+    if not editor_exe.exists():
+        raise FileNotFoundError(f"editor executable not found: {editor_exe}")
+    if not build_bat.exists():
+        raise FileNotFoundError(f"Build.bat not found: {build_bat}")
+
+    return editor_exe, build_bat
+
+
+def _run_offline_build_and_relaunch(args: argparse.Namespace) -> dict:
+    """Build and launch without a live bridge, for the editor-closed workflow."""
+    try:
+        project_path = _discover_uproject_path(getattr(args, "project", None))
+        editor_exe, build_bat = _discover_unreal_build_tools(args, project_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return {
+            "success": False,
+            "status": "offline_configuration_error",
+            "exit_code": 3,
+            "message": str(exc),
+        }
+
+    build_config = getattr(args, "config", None) or "Development"
+    build_timeout = (
+        getattr(args, "build_timeout", None)
+        if getattr(args, "build_timeout", None) is not None
+        else _default_build_and_relaunch_build_timeout()
+    )
+    project_name = project_path.stem
+    command = [
+        str(build_bat),
+        f"{project_name}Editor",
+        "Win64",
+        build_config,
+        f"-Project={project_path}",
+        "-WaitMutex",
+        "-FromMsBuild",
+    ]
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=str(project_path.parent),
+            capture_output=True,
+            text=True,
+            timeout=build_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        return {
+            "success": False,
+            "status": "build_timeout",
+            "exit_code": 2,
+            "project": str(project_path),
+            "build_time_seconds": build_timeout,
+            "build_command": command,
+            "build_output": output,
+            "message": f"Offline build did not finish within {build_timeout:.0f}s.",
+        }
+    except OSError as exc:
+        return {
+            "success": False,
+            "status": "build_launch_failed",
+            "exit_code": 2,
+            "project": str(project_path),
+            "build_command": command,
+            "message": str(exc),
+        }
+
+    build_output = (completed.stdout or "") + (completed.stderr or "")
+    if completed.returncode != 0:
+        return {
+            "success": False,
+            "status": "build_failed",
+            "exit_code": 2,
+            "project": str(project_path),
+            "build_command": command,
+            "build_output": build_output,
+            "message": "Build failed. See build_output for compiler errors.",
+        }
+
+    if getattr(args, "skip_relaunch", False):
+        return {
+            "success": True,
+            "status": "build_succeeded",
+            "project": str(project_path),
+            "build_command": command,
+            "build_output": build_output,
+            "message": "Offline build completed successfully (editor not relaunched).",
+        }
+
+    launch_command = [str(editor_exe), str(project_path)]
+    try:
+        subprocess.Popen(
+            launch_command,
+            cwd=str(project_path.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        return {
+            "success": False,
+            "status": "launch_failed",
+            "exit_code": 3,
+            "project": str(project_path),
+            "build_command": command,
+            "launch_command": launch_command,
+            "build_output": build_output,
+            "message": str(exc),
+        }
+
+    if not getattr(args, "wait", False):
+        return {
+            "success": True,
+            "status": "launched",
+            "project": str(project_path),
+            "build_command": command,
+            "launch_command": launch_command,
+            "build_output": build_output,
+            "message": "Offline build succeeded and editor launch was started.",
+        }
+
+    relaunch_timeout = float(getattr(args, "relaunch_timeout", 120.0) or 120.0)
+    start = time.monotonic()
+    last_health: dict = {}
+    while time.monotonic() - start < relaunch_timeout:
+        last_health = health_check(timeout=5.0)
+        if _bridge_health_is_ready(last_health):
+            return {
+                "success": True,
+                "status": "ready",
+                "project": str(project_path),
+                "build_command": command,
+                "launch_command": launch_command,
+                "build_output": build_output,
+                "ready_time_seconds": round(time.monotonic() - start, 1),
+                "health": last_health,
+                "message": "Offline build succeeded, editor launched, and bridge is ready.",
+            }
+        time.sleep(2.0)
+
+    return {
+        "success": False,
+        "status": "bridge_ready_timeout",
+        "exit_code": 4,
+        "project": str(project_path),
+        "build_command": command,
+        "launch_command": launch_command,
+        "build_output": build_output,
+        "last_health": last_health,
+        "message": f"Editor launched but bridge did not become ready within {relaunch_timeout:.0f}s.",
+    }
 
 
 def _default_build_and_relaunch_build_timeout() -> float:
@@ -1331,8 +1846,8 @@ def _wait_for_build_and_relaunch(
 
         if status_path.exists():
             try:
-                build_status = _json.loads(status_path.read_text().strip())
-            except (_json.JSONDecodeError, OSError):
+                build_status = _json.loads(status_path.read_text(encoding="utf-8-sig").strip())
+            except (_json.JSONDecodeError, OSError, UnicodeDecodeError):
                 time.sleep(poll_interval)
                 continue
             stage = _build_and_relaunch_stage(build_status)
@@ -1462,10 +1977,41 @@ def cmd_capture_screenshot(args: argparse.Namespace) -> None:
         arguments["window_name"] = args.window_name
     if args.region:
         arguments["region"] = _parse_int_list(args.region)
+    if getattr(args, "unsafe_slate_window_capture", False):
+        arguments["safe_mode"] = False
     if args.format:
         arguments["format"] = args.format
     if args.output:
         arguments["output"] = args.output
+    if args.scale is not None:
+        arguments["scale"] = args.scale
+    if args.width is not None:
+        arguments["width"] = args.width
+    if args.height is not None:
+        arguments["height"] = args.height
+    if args.color_mode:
+        arguments["color_mode"] = args.color_mode
+    if args.cleanup_previous:
+        arguments["cleanup_previous"] = True
+    _print_json(_run_tool("capture-screenshot", arguments))
+
+
+def cmd_capture_pie_screenshot(args: argparse.Namespace) -> None:
+    arguments: dict = {"mode": "pie-window"}
+    if args.format:
+        arguments["format"] = args.format
+    if args.output:
+        arguments["output"] = args.output
+    if args.scale is not None:
+        arguments["scale"] = args.scale
+    if args.width is not None:
+        arguments["width"] = args.width
+    if args.height is not None:
+        arguments["height"] = args.height
+    if args.color_mode:
+        arguments["color_mode"] = args.color_mode
+    if args.cleanup_previous:
+        arguments["cleanup_previous"] = True
     _print_json(_run_tool("capture-screenshot", arguments))
 
 
@@ -1477,7 +2023,228 @@ def cmd_capture_viewport(args: argparse.Namespace) -> None:
         arguments["format"] = args.format
     if args.output:
         arguments["output"] = args.output
+    if args.scale is not None:
+        arguments["scale"] = args.scale
+    if args.width is not None:
+        arguments["width"] = args.width
+    if args.height is not None:
+        arguments["height"] = args.height
+    if args.color_mode:
+        arguments["color_mode"] = args.color_mode
+    if args.cleanup_previous:
+        arguments["cleanup_previous"] = True
     _print_json(_run_tool("capture-viewport", arguments))
+
+
+def cmd_compare_umg_screenshot(args: argparse.Namespace) -> None:
+    result = _compare_umg_screenshot_result(
+        args.reference_image,
+        args.captured_image,
+        crop_arg=args.crop,
+        annotated_output=args.annotated_output,
+        threshold=args.threshold,
+    )
+    _print_json(result)
+
+
+def _compare_umg_screenshot_result(
+    reference_image: str,
+    captured_image: str,
+    *,
+    crop_arg: object | None,
+    annotated_output: str | None,
+    threshold: float,
+) -> dict:
+    from .visual_compare import compare_umg_screenshots
+
+    crop = None
+    if crop_arg:
+        if isinstance(crop_arg, (list, tuple)):
+            try:
+                crop_values = [int(value) for value in crop_arg]
+            except (TypeError, ValueError):
+                print("error: --crop must be X,Y,W,H", file=sys.stderr)
+                sys.exit(1)
+        else:
+            crop_values = _parse_int_list(str(crop_arg))
+        if len(crop_values) != 4:
+            print("error: --crop must be X,Y,W,H", file=sys.stderr)
+            sys.exit(1)
+        crop = tuple(crop_values)
+
+    try:
+        return compare_umg_screenshots(
+            reference_image,
+            captured_image,
+            crop=crop,
+            annotated_output=annotated_output,
+            threshold=threshold,
+        )
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_extract_umg_layout(args: argparse.Namespace) -> None:
+    from .umg_layout import extract_concept_image_layout, normalize_figma_layout, normalize_layout
+
+    if args.source == "designer":
+        if not args.asset_path:
+            print("error: --asset-path is required for designer layout extraction", file=sys.stderr)
+            sys.exit(1)
+        raw = _run_tool(
+            "inspect-widget-blueprint",
+            {
+                "asset_path": args.asset_path,
+                "include_defaults": True,
+                "depth_limit": args.depth_limit,
+            },
+        )
+    elif args.source == "runtime":
+        tool_args: dict = {"pie_index": args.pie_index}
+        if args.root_widget:
+            tool_args["root_widget"] = args.root_widget
+        if getattr(args, "full_geometry", False):
+            tool_args["include_geometry"] = True
+            tool_args["include_slate"] = True
+        raw = _run_tool("inspect-runtime-widgets", tool_args)
+    elif args.source == "concept-image":
+        if not getattr(args, "input", None):
+            print("error: --input is required for concept-image layout extraction", file=sys.stderr)
+            sys.exit(1)
+        result = extract_concept_image_layout(
+            args.input,
+            min_region_area=getattr(args, "min_region_area", 64),
+        )
+        if args.output_file:
+            Path(args.output_file).write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+            result["output_file"] = str(args.output_file)
+        _print_json(result)
+        return
+    elif args.source == "figma":
+        if not getattr(args, "input", None):
+            print("error: --input is required for figma layout extraction", file=sys.stderr)
+            sys.exit(1)
+        raw = json.loads(Path(args.input).read_text(encoding="utf-8-sig"))
+        result = normalize_figma_layout(raw)
+        if args.output_file:
+            Path(args.output_file).write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+            result["output_file"] = str(args.output_file)
+        _print_json(result)
+        return
+    else:
+        print(f"error: unsupported UMG layout source: {args.source}", file=sys.stderr)
+        sys.exit(1)
+
+    canvas_size = _parse_int_list(args.canvas_size) if args.canvas_size else None
+    result = normalize_layout(raw, canvas_size=canvas_size)
+    if args.output_file:
+        Path(args.output_file).write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        result["output_file"] = str(args.output_file)
+    _print_json(result)
+
+
+def cmd_compare_umg_layout(args: argparse.Namespace) -> None:
+    from .umg_layout import compare_layouts
+
+    expected = json.loads(Path(args.expected_layout).read_text(encoding="utf-8-sig"))
+    actual = json.loads(Path(args.actual_layout).read_text(encoding="utf-8-sig"))
+    result = compare_layouts(
+        expected,
+        actual,
+        bounds_tolerance=args.bounds_tolerance,
+        opacity_tolerance=args.opacity_tolerance,
+        subset=getattr(args, "subset", False),
+        ignore_masks=_load_umg_ignore_masks(getattr(args, "ignore_mask", None)),
+    )
+    if args.output_file:
+        Path(args.output_file).write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        result["output_file"] = str(args.output_file)
+    _print_json(result)
+
+
+def _load_umg_ignore_masks(values: list[str] | None) -> list[object]:
+    masks: list[object] = []
+    for value in values or []:
+        path = Path(value)
+        if path.exists():
+            parsed = json.loads(path.read_text(encoding="utf-8-sig"))
+        else:
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = {"widget": value}
+        if isinstance(parsed, list):
+            masks.extend(parsed)
+        else:
+            masks.append(parsed)
+    return masks
+
+
+def cmd_umg_layout(args: argparse.Namespace) -> None:
+    if args.layout_action == "extract":
+        cmd_extract_umg_layout(args)
+        return
+
+    if args.layout_action == "compare":
+        if args.mode == "geometry":
+            cmd_compare_umg_layout(args)
+            return
+        if args.mode == "pixel":
+            args.reference_image = args.expected_layout
+            args.captured_image = args.actual_layout
+            cmd_compare_umg_screenshot(args)
+            return
+        if args.mode == "both":
+            if not args.reference_image or not args.captured_image:
+                print("error: --reference-image and --captured-image are required for --mode both", file=sys.stderr)
+                sys.exit(1)
+            from .umg_layout import compare_layouts
+
+            expected = json.loads(Path(args.expected_layout).read_text(encoding="utf-8-sig"))
+            actual = json.loads(Path(args.actual_layout).read_text(encoding="utf-8-sig"))
+            geometry = compare_layouts(
+                expected,
+                actual,
+                bounds_tolerance=args.bounds_tolerance,
+                opacity_tolerance=args.opacity_tolerance,
+                subset=args.subset,
+                ignore_masks=_load_umg_ignore_masks(args.ignore_mask),
+            )
+            pixel = _compare_umg_screenshot_result(
+                args.reference_image,
+                args.captured_image,
+                crop_arg=args.crop,
+                annotated_output=args.annotated_output,
+                threshold=args.threshold,
+            )
+            result = {
+                "success": bool(geometry.get("success")) and bool(pixel.get("success")),
+                "mode": "both",
+                "geometry": geometry,
+                "pixel": pixel,
+            }
+            if args.output_file:
+                Path(args.output_file).write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+                result["output_file"] = str(args.output_file)
+            _print_json(result)
+            return
+
+    if args.layout_action == "fit":
+        from .umg_layout import fit_layout_to_spec
+
+        concept = json.loads(Path(args.concept).read_text(encoding="utf-8-sig"))
+        actual = json.loads(Path(args.actual).read_text(encoding="utf-8-sig"))
+        spec = json.loads(Path(args.spec).read_text(encoding="utf-8-sig"))
+        result = fit_layout_to_spec(concept, actual, spec)
+        if args.output:
+            Path(args.output).write_text(json.dumps(result["corrected_spec"], indent=2, ensure_ascii=False), encoding="utf-8")
+            result["output_file"] = str(args.output)
+        _print_json(result)
+        return
+
+    print(f"error: unsupported umg-layout action: {args.layout_action}", file=sys.stderr)
+    sys.exit(1)
 
 
 def cmd_query_material(args: argparse.Namespace) -> None:
@@ -1554,6 +2321,14 @@ def cmd_pie_session(args: argparse.Namespace) -> None:
         arguments["expected"] = _parse_json_arg(args.expected, "--expected")
     if args.wait_timeout is not None:
         arguments["wait_timeout"] = args.wait_timeout
+    if getattr(args, "continue_on_blueprint_compile_errors", False):
+        arguments["blueprint_error_action"] = "continue"
+    elif getattr(args, "blueprint_error_action", None):
+        arguments["blueprint_error_action"] = args.blueprint_error_action
+    if getattr(args, "preflight_blueprints", False):
+        arguments["preflight_blueprints"] = True
+    if getattr(args, "no_cleanup_tool_previews", False):
+        arguments["cleanup_tool_previews"] = False
     _print_json(_run_tool("pie-session", arguments))
 
 
@@ -1588,7 +2363,15 @@ def cmd_pie_tick(args: argparse.Namespace) -> None:
 
 
 def cmd_inspect_anim_instance(args: argparse.Namespace) -> None:
-    arguments: dict = {"actor_tag": args.actor_tag}
+    if not args.actor_tag and not getattr(args, "asset_path", None):
+        print("error: provide --actor-tag for runtime inspection or --asset-path for static AnimBlueprint topology", file=sys.stderr)
+        sys.exit(1)
+
+    arguments: dict = {}
+    if args.actor_tag:
+        arguments["actor_tag"] = args.actor_tag
+    if getattr(args, "asset_path", None):
+        arguments["asset_path"] = args.asset_path
     if args.mesh_component:
         arguments["mesh_component"] = args.mesh_component
     if args.include:
@@ -1596,6 +2379,46 @@ def cmd_inspect_anim_instance(args: argparse.Namespace) -> None:
     if args.blend_weights:
         arguments["blend_weights"] = [part for part in args.blend_weights.split(",") if part]
     _print_json(_run_tool("inspect-anim-instance", arguments))
+
+
+def cmd_inspect_sync_markers(args: argparse.Namespace) -> None:
+    _print_json(_run_tool("inspect-sync-markers", {"asset_path": args.asset_path}))
+
+
+def cmd_compare_sync_markers(args: argparse.Namespace) -> None:
+    arguments: dict = {"asset_paths": args.asset_paths}
+    if args.marker:
+        arguments["marker"] = args.marker
+    _print_json(_run_tool("compare-sync-markers", arguments))
+
+
+def cmd_add_sync_marker(args: argparse.Namespace) -> None:
+    arguments: dict = {
+        "asset_path": args.asset_path,
+        "marker": args.marker,
+        "time": args.time,
+    }
+    if args.save:
+        arguments["save"] = True
+    if args.checkout:
+        arguments["checkout"] = True
+    _print_json(_run_tool("add-sync-marker", arguments))
+
+
+def cmd_remove_sync_marker(args: argparse.Namespace) -> None:
+    arguments: dict = {
+        "asset_path": args.asset_path,
+        "marker": args.marker,
+    }
+    if args.time is not None:
+        arguments["time"] = args.time
+    if args.tolerance is not None:
+        arguments["tolerance"] = args.tolerance
+    if args.save:
+        arguments["save"] = True
+    if args.checkout:
+        arguments["checkout"] = True
+    _print_json(_run_tool("remove-sync-marker", arguments))
 
 
 def cmd_trigger_input(args: argparse.Namespace) -> None:
@@ -1865,6 +2688,175 @@ def cmd_inspect_runtime_widgets(args: argparse.Namespace) -> None:
     if args.root_widget:
         arguments["root_widget"] = args.root_widget
     _print_json(_run_tool("inspect-runtime-widgets", arguments))
+
+
+def cmd_apply_widget_tree(args: argparse.Namespace) -> None:
+    if bool(args.spec) == bool(args.spec_file):
+        print("error: either --spec or --spec-file is required", file=sys.stderr)
+        sys.exit(1)
+
+    spec = (
+        _parse_json_object_arg(args.spec, "--spec")
+        if args.spec
+        else _parse_json_object_file_arg(args.spec_file, "--spec-file")
+    )
+    arguments: dict = {
+        "asset_path": args.asset_path,
+        "spec": spec,
+    }
+    if args.append:
+        arguments["replace"] = False
+    if args.compile:
+        arguments["compile"] = True
+    if args.save:
+        arguments["save"] = True
+    if args.checkout:
+        arguments["checkout"] = True
+    _print_json(_run_tool("apply-widget-tree", arguments))
+
+
+def cmd_wire_widget_navigation(args: argparse.Namespace) -> None:
+    if bool(args.bindings) == bool(args.bindings_file):
+        print("error: either --bindings or --bindings-file is required", file=sys.stderr)
+        sys.exit(1)
+
+    bindings = (
+        _parse_json_array_arg(args.bindings, "--bindings")
+        if args.bindings
+        else _parse_json_array_file_arg(args.bindings_file, "--bindings-file")
+    )
+    arguments: dict = {
+        "asset_path": args.asset_path,
+        "bindings": bindings,
+    }
+    if args.compile:
+        arguments["compile"] = True
+    if args.save:
+        arguments["save"] = True
+    if args.checkout:
+        arguments["checkout"] = True
+    if args.allow_pie:
+        arguments["allow_pie"] = True
+    if getattr(args, "allow_busy", False):
+        arguments["allow_busy"] = True
+    _print_json(_run_tool("wire-widget-navigation", arguments))
+
+
+def cmd_verify_umg_workflow(args: argparse.Namespace) -> None:
+    arguments: dict = {}
+    if args.widget_class:
+        arguments["widget_class"] = args.widget_class
+    if args.root_widget:
+        arguments["root_widget"] = args.root_widget
+    if args.expected_widgets:
+        arguments["expected_widgets"] = _parse_json_array_arg(args.expected_widgets, "--expected-widgets")
+    if args.expected_widgets_file:
+        arguments["expected_widgets"] = _parse_json_array_file_arg(args.expected_widgets_file, "--expected-widgets-file")
+    if args.expected_text:
+        arguments["expected_text"] = _parse_json_array_arg(args.expected_text, "--expected-text")
+    if args.expected_text_file:
+        arguments["expected_text"] = _parse_json_array_file_arg(args.expected_text_file, "--expected-text-file")
+    if args.click_sequence:
+        arguments["click_sequence"] = _parse_json_array_arg(args.click_sequence, "--click-sequence")
+    if args.click_sequence_file:
+        arguments["click_sequence"] = _parse_json_array_file_arg(args.click_sequence_file, "--click-sequence-file")
+    if args.pie_index is not None:
+        arguments["pie_index"] = args.pie_index
+    if args.viewport_z_order is not None:
+        arguments["viewport_z_order"] = args.viewport_z_order
+    if args.capture_after:
+        arguments["capture_after"] = True
+    if args.remove_preview:
+        arguments["remove_preview"] = True
+    if getattr(args, "preview_lifecycle", None):
+        arguments["preview_lifecycle"] = args.preview_lifecycle
+    _print_json(_run_tool("verify-umg-workflow", arguments))
+
+
+def _run_verify_umg_workflow_from_namespace(args: argparse.Namespace, *, preview_lifecycle: str | None = None) -> None:
+    arguments: dict = {}
+    if getattr(args, "widget_class", None):
+        arguments["widget_class"] = args.widget_class
+    if getattr(args, "root_widget", None):
+        arguments["root_widget"] = args.root_widget
+    if getattr(args, "expected_widgets", None):
+        arguments["expected_widgets"] = _parse_json_array_arg(args.expected_widgets, "--expected-widgets")
+    if getattr(args, "expected_widgets_file", None):
+        arguments["expected_widgets"] = _parse_json_array_file_arg(args.expected_widgets_file, "--expected-widgets-file")
+    if getattr(args, "expected_text", None):
+        arguments["expected_text"] = _parse_json_array_arg(args.expected_text, "--expected-text")
+    if getattr(args, "expected_text_file", None):
+        arguments["expected_text"] = _parse_json_array_file_arg(args.expected_text_file, "--expected-text-file")
+    if getattr(args, "click_sequence", None):
+        arguments["click_sequence"] = _parse_json_array_arg(args.click_sequence, "--click-sequence")
+    if getattr(args, "click_sequence_file", None):
+        arguments["click_sequence"] = _parse_json_array_file_arg(args.click_sequence_file, "--click-sequence-file")
+    if getattr(args, "pie_index", None) is not None:
+        arguments["pie_index"] = args.pie_index
+    if getattr(args, "viewport_z_order", None) is not None:
+        arguments["viewport_z_order"] = args.viewport_z_order
+    if getattr(args, "capture_after", False):
+        arguments["capture_after"] = True
+    if getattr(args, "remove_preview", False):
+        arguments["remove_preview"] = True
+    if preview_lifecycle:
+        arguments["preview_lifecycle"] = preview_lifecycle
+    elif getattr(args, "preview_lifecycle", None):
+        arguments["preview_lifecycle"] = args.preview_lifecycle
+    _print_json(_run_tool("verify-umg-workflow", arguments))
+
+
+def cmd_umg_preview_create(args: argparse.Namespace) -> None:
+    _run_umg_preview_tool(args, "umg-preview-create")
+
+
+def cmd_umg_preview_replace(args: argparse.Namespace) -> None:
+    _run_umg_preview_tool(args, "umg-preview-replace")
+
+
+def cmd_umg_preview_remove(args: argparse.Namespace) -> None:
+    _run_umg_preview_tool(args, "umg-preview-remove")
+
+
+def cmd_umg_preview_list(args: argparse.Namespace) -> None:
+    _run_umg_preview_tool(args, "umg-preview-list")
+
+
+def _run_umg_preview_tool(args: argparse.Namespace, tool_name: str) -> None:
+    arguments: dict = {}
+    if getattr(args, "widget_class", None):
+        arguments["widget_class"] = args.widget_class
+    if getattr(args, "preview_handle", None):
+        arguments["preview_handle"] = args.preview_handle
+    if getattr(args, "pie_index", None) is not None:
+        arguments["pie_index"] = args.pie_index
+    if getattr(args, "viewport_z_order", None) is not None:
+        arguments["viewport_z_order"] = args.viewport_z_order
+    if getattr(args, "capture_after", False):
+        arguments["capture_after"] = True
+    _print_json(_run_tool(tool_name, arguments))
+
+
+def cmd_umg_verify_widgets(args: argparse.Namespace) -> None:
+    _run_verify_umg_workflow_from_namespace(args)
+
+
+def cmd_umg_verify_text(args: argparse.Namespace) -> None:
+    _run_verify_umg_workflow_from_namespace(args)
+
+
+def cmd_umg_verify_navigation(args: argparse.Namespace) -> None:
+    _run_verify_umg_workflow_from_namespace(args)
+
+
+def cmd_umg_workflow_run(args: argparse.Namespace) -> None:
+    plan = json.loads(Path(args.plan).read_text(encoding="utf-8-sig"))
+    _print_json({
+        "success": False,
+        "error_code": "workflow_runner_not_implemented",
+        "message": "umg workflow run metadata is available; orchestration execution will be implemented in the next bridge split.",
+        "plan": plan,
+    })
 
 
 def cmd_set_asset_property(args: argparse.Namespace) -> None:
@@ -2198,6 +3190,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
     plugin_dest = project_path / "Plugins" / "SoftUEBridge"
     claude_md = project_path / "CLAUDE.md"
     cli_cmd = f"{sys.executable} -m soft_ue_cli"
+    plugin_source_dest = plugin_dest / "Source"
 
     print(
         f"Install the SoftUEBridge UE plugin into the project at {project_path}:\n\n"
@@ -2205,9 +3198,14 @@ def cmd_setup(args: argparse.Namespace) -> None:
         f"     {plugin_src}\n"
         f"   to\n"
         f"     {plugin_dest}\n\n"
-        f'2. Edit {uproject_hint} - add to the "Plugins" array:\n'
+        f"2. Refresh the copied plugin Source timestamps before rebuilding so UnrealHeaderTool\n"
+        f"   regenerates stale generated files after updating an existing plugin copy:\n"
+        f"     PowerShell: Get-ChildItem -Path \"{plugin_source_dest}\" -Recurse -File | "
+        f"Where-Object {{ $_.Extension -in '.h','.hpp','.cpp' }} | "
+        f"ForEach-Object {{ $_.LastWriteTime = Get-Date }}\n\n"
+        f'3. Edit {uproject_hint} - add to the "Plugins" array:\n'
         f'     {{"Name": "SoftUEBridge", "Enabled": true}}\n\n'
-        f"3. Create or append to {claude_md}:\n\n"
+        f"4. Create or append to {claude_md}:\n\n"
         f"{_claude_md_section(cli_cmd)}\n"
         f"After the user rebuilds and launches UE, verify with:\n"
         f"  {cli_cmd} check-setup"
@@ -2804,8 +3802,39 @@ def cmd_rewind_save(args: argparse.Namespace) -> None:
 # -- Argument parser -----------------------------------------------------------
 
 
+def _add_capture_transform_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--scale",
+        type=float,
+        metavar="PERCENT",
+        help="Scale output image size by percentage; 100 keeps current size, 50 halves width and height",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        metavar="PX",
+        help="Requested output width in pixels; height is derived when --height is omitted",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        metavar="PX",
+        help="Requested output height in pixels; width is derived when --width is omitted",
+    )
+    parser.add_argument(
+        "--color-mode",
+        choices=["color", "grayscale", "monochrome"],
+        help="Output color mode (default: color)",
+    )
+    parser.add_argument(
+        "--cleanup-previous",
+        action="store_true",
+        help="Delete previous matching capture files before writing the new file",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = SoftUEArgumentParser(
         prog="soft-ue-cli",
         description=(
             "Control a running Unreal Engine game or editor via the SoftUEBridge C++ plugin.\n"
@@ -2838,6 +3867,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_commands = sub.add_parser(
+        "commands",
+        help="List command taxonomy, canonical replacements, and availability metadata.",
+        description=(
+            "List public soft-ue-cli command metadata. Use --json for machine-readable output.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli commands\n"
+            "  soft-ue-cli commands --json\n"
+            "  soft-ue-cli commands --category umg\n"
+            "  soft-ue-cli commands --include-removed"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_commands.add_argument("--json", action="store_true", help="Emit machine-readable command metadata")
+    p_commands.add_argument("--probe", action="store_true", help="Augment JSON output with live bridge availability when available")
+    p_commands.add_argument("--category", help="Filter by category or command family token")
+    p_commands.add_argument("--requires-bridge", action="store_true", help="Only show commands that require the bridge")
+    p_commands.add_argument("--include-removed", action="store_true", help="Include removed flat commands and their canonical migrations")
+    p_commands.add_argument("--plugin", help="Only show commands that require the named Unreal plugin")
+    p_commands.set_defaults(func=cmd_commands)
 
     # setup
     p_setup = sub.add_parser(
@@ -3069,6 +4119,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Filter properties by name (wildcards supported, e.g., '*Health*'). Requires --include-properties.",
     )
     p_ql.add_argument("--limit", type=int, default=100, metavar="N", help="Max actors to return (default: 100)")
+    p_ql.add_argument("--world", choices=["editor", "pie", "game"], help="World context for actor lookup")
     p_ql.add_argument("--include-foliage", action="store_true", help="Include FoliageType instance counts")
     p_ql.add_argument("--include-grass", action="store_true", help="Include LandscapeProxy grass/material info")
     p_ql.set_defaults(func=cmd_query_level)
@@ -3087,8 +4138,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_cf.add_argument("actor_name", nargs="?", help="Legacy positional actor name or label")
-    p_cf.add_argument("function_name", nargs="?", help="Legacy positional function name")
+    p_cf.add_argument("legacy_actor_name", nargs="?", help="Legacy positional actor name or label")
+    p_cf.add_argument("legacy_function_name", nargs="?", help="Legacy positional function name")
     p_cf.add_argument("--actor-name", dest="actor_name", metavar="NAME", help="Actor name or label (supports wildcards)")
     p_cf.add_argument("--class-path", metavar="PATH", help="Blueprint/class path for --use-cdo or --spawn-transient")
     p_cf.add_argument("--function-name", dest="function_name", metavar="NAME", help="Exact function name (case-sensitive)")
@@ -3141,6 +4192,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_gp.add_argument("actor_name", help="Actor name or label as shown in query-level output")
     p_gp.add_argument("property_name", help="Property name, or ComponentName.PropertyName for component properties")
+    p_gp.add_argument("--world", choices=["editor", "pie", "game"], help="World context for actor lookup")
     p_gp.set_defaults(func=cmd_get_property)
 
     # get-logs
@@ -3762,6 +4814,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_qbg.add_argument(
         "--include-anim-props", action="store_true", help="Include AnimNode struct properties on AnimGraph nodes"
     )
+    p_qbg.add_argument(
+        "--recursive",
+        "--all-graphs",
+        action="store_true",
+        help="Include nested AnimBlueprint graphs and add graph_path to every serialized node",
+    )
+    p_qbg.add_argument(
+        "--node-class",
+        metavar="PATTERN",
+        help="Comma-separated node class filters, e.g. AnimGraphNode_StateMachine,*BlendStack*",
+    )
     p_qbg.set_defaults(func=cmd_query_blueprint_graph)
 
     # -------------------------------------------------------------------------
@@ -3790,6 +4853,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_bar.add_argument("--skip-relaunch", action="store_true", help="Build only, do not relaunch the editor")
     p_bar.add_argument("--wait", action="store_true", help="Wait for build to complete and editor to relaunch, then return the result")
     p_bar.add_argument(
+        "--startup-marker-timeout",
+        type=float,
+        metavar="SEC",
+        help="Seconds for the bridge to wait for the detached build worker startup marker (default: 30)",
+    )
+    p_bar.add_argument(
         "--startup-recovery",
         choices=["ask", "remembered", "recover", "skip", "manual"],
         default="ask",
@@ -3814,6 +4883,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=120.0,
         help="Seconds to wait for the editor bridge to come back after a successful build (default: 120)",
+    )
+    p_bar.add_argument("--project", metavar="PATH", help=".uproject path for offline fallback when the bridge is unavailable")
+    p_bar.add_argument("--editor-exe", metavar="PATH", help="UnrealEditor.exe path for offline fallback")
+    p_bar.add_argument("--build-bat", metavar="PATH", help="Unreal Build.bat path for offline fallback")
+    p_bar.add_argument(
+        "--no-offline-fallback",
+        action="store_false",
+        dest="offline_fallback",
+        default=True,
+        help="Require a live bridge and do not run the editor-closed offline build path",
     )
     p_bar.set_defaults(func=cmd_build_and_relaunch)
 
@@ -3878,16 +4957,39 @@ def build_parser() -> argparse.ArgumentParser:
             "  soft-ue-cli capture-screenshot window\n"
             "  soft-ue-cli capture-screenshot tab --window-name Blueprint\n"
             "  soft-ue-cli capture-screenshot region --region 0,0,800,600 --output base64\n"
-            "  soft-ue-cli capture-screenshot viewport"
+            "  soft-ue-cli capture-screenshot viewport --scale 50 --color-mode grayscale"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_cs2.add_argument("mode", choices=["window", "tab", "region", "viewport"], help="Capture mode")
+    p_cs2.add_argument("mode", choices=["window", "tab", "region", "viewport", "pie-window"], help="Capture mode")
     p_cs2.add_argument("--window-name", metavar="NAME", help="Editor panel name for 'tab' mode")
     p_cs2.add_argument("--region", metavar="X,Y,W,H", help="Screen coordinates for 'region' mode")
+    p_cs2.add_argument(
+        "--unsafe-slate-window-capture",
+        action="store_true",
+        help="Allow direct full Slate window capture during PIE instead of the safe PIE viewport fallback",
+    )
     p_cs2.add_argument("--format", choices=["png", "jpeg"], help="Image format (default: png)")
     p_cs2.add_argument("--output", choices=["file", "base64"], help="Output mode: file (default) or base64")
+    _add_capture_transform_args(p_cs2)
     p_cs2.set_defaults(func=cmd_capture_screenshot)
+
+    p_cps = sub.add_parser(
+        "capture-pie-screenshot",
+        help="Capture the composited PIE viewport, including UMG overlays.",
+        description=(
+            "Capture the final user-visible PIE viewport after Slate/UMG composition.\n"
+            "This is a convenience wrapper around capture-screenshot pie-window.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli capture-pie-screenshot\n"
+            "  soft-ue-cli capture-pie-screenshot --output base64 --scale 70"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_cps.add_argument("--format", choices=["png", "jpeg"], help="Image format (default: png)")
+    p_cps.add_argument("--output", choices=["file", "base64"], help="Output mode: file (default) or base64")
+    _add_capture_transform_args(p_cps)
+    p_cps.set_defaults(func=cmd_capture_pie_screenshot)
 
     # ---- capture-viewport (runtime — works in PIE and standalone) ----
 
@@ -3902,7 +5004,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  soft-ue-cli capture-viewport\n"
             "  soft-ue-cli capture-viewport --source editor\n"
             "  soft-ue-cli capture-viewport --format jpeg\n"
-            "  soft-ue-cli capture-viewport --output base64"
+            "  soft-ue-cli capture-viewport --output base64 --scale 50\n"
+            "  soft-ue-cli capture-viewport --width 640 --color-mode monochrome"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -3910,7 +5013,336 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Viewport source: auto (default), game (PIE/standalone), editor")
     p_cv.add_argument("--format", choices=["png", "jpeg"], help="Image format (default: png)")
     p_cv.add_argument("--output", choices=["file", "base64"], help="Output mode: file (default) or base64")
+    _add_capture_transform_args(p_cv)
     p_cv.set_defaults(func=cmd_capture_viewport)
+
+    p_capture = sub.add_parser(
+        "capture",
+        help="Canonical capture command family.",
+        description=(
+            "Canonical capture command family.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli capture viewport --source editor --scale 50\n"
+            "  soft-ue-cli capture screenshot --source pie-window --output base64"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    capture_sub = p_capture.add_subparsers(dest="capture_action", required=True)
+
+    p_capture_viewport = capture_sub.add_parser(
+        "viewport",
+        help="Capture a game or editor viewport.",
+        description=(
+            "Capture a viewport screenshot through the existing capture-viewport bridge tool.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli capture viewport\n"
+            "  soft-ue-cli capture viewport --source editor\n"
+            "  soft-ue-cli capture viewport --output base64 --scale 50"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_capture_viewport.add_argument("--source", choices=["auto", "game", "editor"],
+                                    help="Viewport source: auto (default), game (PIE/standalone), editor")
+    p_capture_viewport.add_argument("--format", choices=["png", "jpeg"], help="Image format (default: png)")
+    p_capture_viewport.add_argument("--output", choices=["file", "base64"], help="Output mode: file (default) or base64")
+    _add_capture_transform_args(p_capture_viewport)
+    p_capture_viewport.set_defaults(func=cmd_capture_viewport)
+
+    p_capture_screenshot = capture_sub.add_parser(
+        "screenshot",
+        help="Capture an editor, viewport, region, or PIE window screenshot.",
+        description=(
+            "Capture a screenshot through the existing capture-screenshot bridge tool.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli capture screenshot --source window\n"
+            "  soft-ue-cli capture screenshot --source tab --window-name Blueprint\n"
+            "  soft-ue-cli capture screenshot --source region --region 0,0,800,600\n"
+            "  soft-ue-cli capture screenshot --source pie-window --scale 50"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_capture_screenshot.add_argument(
+        "--source",
+        dest="mode",
+        default="viewport",
+        choices=["window", "tab", "region", "viewport", "pie-window"],
+        help="Screenshot source (default: viewport)",
+    )
+    p_capture_screenshot.add_argument("--window-name", metavar="NAME", help="Editor panel name for --source tab")
+    p_capture_screenshot.add_argument("--region", metavar="X,Y,W,H", help="Screen coordinates for --source region")
+    p_capture_screenshot.add_argument(
+        "--unsafe-slate-window-capture",
+        action="store_true",
+        help="Allow direct full Slate window capture during PIE instead of the safe PIE viewport fallback",
+    )
+    p_capture_screenshot.add_argument("--format", choices=["png", "jpeg"], help="Image format (default: png)")
+    p_capture_screenshot.add_argument("--output", choices=["file", "base64"], help="Output mode: file (default) or base64")
+    _add_capture_transform_args(p_capture_screenshot)
+    p_capture_screenshot.set_defaults(func=cmd_capture_screenshot)
+
+    p_cus = sub.add_parser(
+        "compare-umg-screenshot",
+        help="Compare a captured UMG screenshot against a reference image.",
+        description=(
+            "Compare a reference concept image and a captured UMG screenshot offline.\n"
+            "Returns JSON with similarity, color/brightness deltas, layout-region scores,\n"
+            "and optional annotated diff output.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli compare-umg-screenshot reference.png captured.png\n"
+            "  soft-ue-cli compare-umg-screenshot reference.png captured.png --crop 0,0,1280,720 --annotated-output diff.png"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_cus.add_argument("reference_image", help="Reference concept image path")
+    p_cus.add_argument("captured_image", help="Captured UMG screenshot path")
+    p_cus.add_argument("--crop", metavar="X,Y,W,H", help="Crop the captured image to the PIE viewport before comparing")
+    p_cus.add_argument("--threshold", type=float, default=0.9, help="Similarity threshold for suggestions (default: 0.9)")
+    p_cus.add_argument("--annotated-output", metavar="PATH", help="Optional path for an annotated diff PNG")
+    p_cus.set_defaults(func=cmd_compare_umg_screenshot)
+
+    p_eul = sub.add_parser(
+        "extract-umg-layout",
+        help="Extract normalized UMG layout JSON from designer or runtime inspection data.",
+        description=(
+            "Normalize UMG widget geometry into a layout JSON artifact that can be diffed offline.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli extract-umg-layout designer --asset-path /Game/UI/WBP_Menu --output-file umg_expected_layout.json\n"
+            "  soft-ue-cli extract-umg-layout runtime --root-widget WBP_Menu_C_0 --output-file umg_runtime_layout.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_eul.add_argument("source", choices=["designer", "runtime", "concept-image", "figma"], help="Layout source to inspect")
+    p_eul.add_argument("--asset-path", metavar="PATH", help="Widget Blueprint asset path for designer extraction")
+    p_eul.add_argument("--root-widget", metavar="NAME", help="Runtime root widget name for runtime extraction")
+    p_eul.add_argument("--input", metavar="PATH", help="Concept image or Figma/Stitch JSON input path")
+    p_eul.add_argument("--pie-index", type=int, default=0, help="PIE instance index for runtime extraction (default: 0)")
+    p_eul.add_argument("--depth-limit", type=int, default=12, help="Designer widget tree depth limit (default: 12)")
+    p_eul.add_argument("--canvas-size", metavar="W,H", help="Canvas size used for normalized bounds (default: 1920,1080)")
+    p_eul.add_argument("--full-geometry", action="store_true", help="Request full runtime geometry and Slate geometry when extracting runtime layout")
+    p_eul.add_argument("--min-region-area", type=int, default=64, help="Minimum concept-image foreground region area in pixels (default: 64)")
+    p_eul.add_argument("--output-file", metavar="PATH", help="Optional path to write normalized layout JSON")
+    p_eul.set_defaults(func=cmd_extract_umg_layout)
+
+    p_cul = sub.add_parser(
+        "compare-umg-layout",
+        help="Compare expected and actual UMG layout JSON artifacts.",
+        description=(
+            "Compare normalized UMG layout JSON files offline and report geometry, z-order,\n"
+            "visibility, text, and opacity differences.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli compare-umg-layout umg_expected_layout.json umg_runtime_layout.json\n"
+            "  soft-ue-cli compare-umg-layout expected.json actual.json --bounds-tolerance 0.01 --output-file umg_layout_report.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_cul.add_argument("expected_layout", help="Expected normalized layout JSON path")
+    p_cul.add_argument("actual_layout", help="Actual normalized layout JSON path")
+    p_cul.add_argument("--bounds-tolerance", type=float, default=0.02, help="Normalized bounds tolerance (default: 0.02)")
+    p_cul.add_argument("--opacity-tolerance", type=float, default=0.05, help="Opacity tolerance (default: 0.05)")
+    p_cul.add_argument("--subset", action="store_true", help="Only compare expected widgets and ignore extra actual widgets")
+    p_cul.add_argument("--ignore-mask", action="append", help="Widget name, JSON object/list, or JSON file path to ignore during comparison")
+    p_cul.add_argument("--output-file", metavar="PATH", help="Optional path to write the comparison report JSON")
+    p_cul.set_defaults(func=cmd_compare_umg_layout)
+
+    p_ul = sub.add_parser(
+        "umg-layout",
+        help="Run the normalized UMG layout pipeline.",
+        description=(
+            "Unified UMG layout pipeline for extraction, comparison, and fitting.\n"
+            "This flat command has been removed from the public CLI; use the\n"
+            "canonical `umg layout` command family.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli umg layout extract --source concept-image --input concept.png --output concept_layout.json\n"
+            "  soft-ue-cli umg layout extract --source runtime --root-widget WBP_Menu_C_0 --full-geometry --output runtime_layout.json\n"
+            "  soft-ue-cli umg layout compare --mode geometry --subset concept_layout.json runtime_layout.json\n"
+            "  soft-ue-cli umg layout fit --concept concept_layout.json --actual runtime_layout.json --spec generated_spec.json --output corrected_spec.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_ul.set_defaults(func=cmd_umg_layout)
+    ul_sub = p_ul.add_subparsers(dest="layout_action", required=True)
+
+    p_ul_extract = ul_sub.add_parser("extract", help="Extract a normalized layout artifact")
+    p_ul_extract.add_argument("--source", choices=["designer", "runtime", "figma", "concept-image"], required=True, help="Layout source")
+    p_ul_extract.add_argument("--input", metavar="PATH", help="Concept image or Figma/Stitch JSON input path")
+    p_ul_extract.add_argument("--asset-path", metavar="PATH", help="Widget Blueprint asset path for designer extraction")
+    p_ul_extract.add_argument("--root-widget", metavar="NAME", help="Runtime root widget name for runtime extraction")
+    p_ul_extract.add_argument("--pie-index", type=int, default=0, help="PIE instance index for runtime extraction (default: 0)")
+    p_ul_extract.add_argument("--depth-limit", type=int, default=12, help="Designer widget tree depth limit (default: 12)")
+    p_ul_extract.add_argument("--canvas-size", metavar="W,H", help="Canvas size used for normalized bounds")
+    p_ul_extract.add_argument("--full-geometry", action="store_true", help="Request full runtime and Slate geometry")
+    p_ul_extract.add_argument("--min-region-area", type=int, default=64, help="Minimum concept-image foreground region area in pixels")
+    p_ul_extract.add_argument("--output", dest="output_file", metavar="PATH", help="Optional path to write normalized layout JSON")
+    p_ul_extract.set_defaults(func=cmd_umg_layout)
+
+    p_ul_compare = ul_sub.add_parser("compare", help="Compare layout or pixel artifacts")
+    p_ul_compare.add_argument("expected_layout", help="Expected layout JSON path, or reference image for --mode pixel")
+    p_ul_compare.add_argument("actual_layout", help="Actual layout JSON path, or captured image for --mode pixel")
+    p_ul_compare.add_argument("--mode", choices=["geometry", "pixel", "both"], default="geometry", help="Comparison mode (default: geometry)")
+    p_ul_compare.add_argument("--subset", action="store_true", help="Only compare expected widgets and ignore extra actual widgets")
+    p_ul_compare.add_argument("--ignore-mask", action="append", help="Widget name, JSON object/list, or JSON file path to ignore")
+    p_ul_compare.add_argument("--bounds-tolerance", type=float, default=0.02, help="Normalized bounds tolerance")
+    p_ul_compare.add_argument("--opacity-tolerance", type=float, default=0.05, help="Opacity tolerance")
+    p_ul_compare.add_argument("--crop", metavar="X,Y,W,H", help="Crop captured image for pixel comparison")
+    p_ul_compare.add_argument("--threshold", type=float, default=0.9, help="Pixel similarity threshold")
+    p_ul_compare.add_argument("--annotated-output", metavar="PATH", help="Optional annotated pixel diff output")
+    p_ul_compare.add_argument("--reference-image", metavar="PATH", help="Reference image for --mode both")
+    p_ul_compare.add_argument("--captured-image", metavar="PATH", help="Captured image for --mode both")
+    p_ul_compare.add_argument("--output", dest="output_file", metavar="PATH", help="Optional path to write comparison report JSON")
+    p_ul_compare.set_defaults(func=cmd_umg_layout)
+
+    p_ul_fit = ul_sub.add_parser("fit", help="Emit a corrected apply-widget-tree spec from layout deltas")
+    p_ul_fit.add_argument("--concept", required=True, help="Concept or expected normalized layout JSON")
+    p_ul_fit.add_argument("--actual", required=True, help="Runtime or actual normalized layout JSON")
+    p_ul_fit.add_argument("--spec", required=True, help="Current apply-widget-tree JSON spec")
+    p_ul_fit.add_argument("--output", metavar="PATH", help="Optional path to write corrected apply-widget-tree JSON")
+    p_ul_fit.set_defaults(func=cmd_umg_layout)
+
+    p_umg = sub.add_parser(
+        "umg",
+        help="Canonical UMG command family.",
+        description=(
+            "Canonical UMG command family for designer authoring, navigation,\n"
+            "preview lifecycle, verification, layout comparison, and workflows.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli umg designer apply /Game/UI/WBP_Menu --spec-file menu.json --compile --save\n"
+            "  soft-ue-cli umg navigation wire /Game/UI/WBP_Menu --bindings-file navigation.json\n"
+            "  soft-ue-cli umg layout compare --mode geometry expected.json actual.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    umg_sub = p_umg.add_subparsers(dest="umg_action", required=True)
+
+    p_umg_designer = umg_sub.add_parser("designer", help="Inspect or apply UMG Designer trees")
+    umg_designer_sub = p_umg_designer.add_subparsers(dest="designer_action", required=True)
+    p_umg_designer_apply = umg_designer_sub.add_parser("apply", help="Apply a declarative widget tree spec")
+    p_umg_designer_apply.add_argument("asset_path", help="Widget Blueprint asset path")
+    p_umg_designer_apply.add_argument("--spec", help="Widget tree spec JSON object")
+    p_umg_designer_apply.add_argument("--spec-file", help="Path to widget tree spec JSON")
+    p_umg_designer_apply.add_argument("--append", action="store_true", help="Append children instead of replacing the Designer tree")
+    p_umg_designer_apply.add_argument("--compile", action="store_true", help="Compile the Widget Blueprint after mutation")
+    p_umg_designer_apply.add_argument("--save", action="store_true", help="Save the Widget Blueprint after mutation")
+    p_umg_designer_apply.add_argument("--checkout", action="store_true", help="Checkout the asset before mutation")
+    p_umg_designer_apply.set_defaults(func=cmd_apply_widget_tree)
+    p_umg_designer_inspect = umg_designer_sub.add_parser("inspect", help="Inspect a Widget Blueprint Designer tree")
+    p_umg_designer_inspect.add_argument("asset_path", help="Widget Blueprint asset path")
+    p_umg_designer_inspect.add_argument("--include-defaults", action="store_true", help="Include resolved default property values")
+    p_umg_designer_inspect.add_argument("--depth-limit", type=int, help="Maximum widget tree depth")
+    p_umg_designer_inspect.add_argument("--no-bindings", action="store_true", help="Exclude binding metadata")
+    p_umg_designer_inspect.set_defaults(func=cmd_inspect_widget_blueprint)
+
+    p_umg_nav = umg_sub.add_parser("navigation", help="Validate or wire UMG navigation contracts")
+    umg_nav_sub = p_umg_nav.add_subparsers(dest="navigation_action", required=True)
+    for nav_action, nav_help in (("wire", "Wire named navigation buttons"), ("verify", "Validate navigation bindings without saving")):
+        p_umg_nav_action = umg_nav_sub.add_parser(nav_action, help=nav_help)
+        p_umg_nav_action.add_argument("asset_path", help="Widget Blueprint asset path")
+        p_umg_nav_action.add_argument("--bindings", help="Navigation bindings JSON array")
+        p_umg_nav_action.add_argument("--bindings-file", help="Path to navigation bindings JSON")
+        p_umg_nav_action.add_argument("--compile", action="store_true", help="Compile the Widget Blueprint after mutation")
+        p_umg_nav_action.add_argument("--save", action="store_true", help="Save the Widget Blueprint after mutation")
+        p_umg_nav_action.add_argument("--checkout", action="store_true", help="Checkout the asset before mutation")
+        p_umg_nav_action.add_argument("--allow-pie", action="store_true", help="Allow mutation while PIE is active")
+        p_umg_nav_action.add_argument("--allow-busy", action="store_true", help="Allow mutation while the editor is saving or garbage collecting")
+        p_umg_nav_action.set_defaults(func=cmd_wire_widget_navigation)
+
+    p_umg_preview = umg_sub.add_parser("preview", help="Manage tool-owned runtime preview widgets")
+    umg_preview_sub = p_umg_preview.add_subparsers(dest="preview_action", required=True)
+    for preview_action, preview_func, help_text in (
+        ("create", cmd_umg_preview_create, "Create a tool-owned preview widget without removing existing previews"),
+        ("replace", cmd_umg_preview_replace, "Replace existing tool-owned previews with a new preview widget"),
+    ):
+        p_preview = umg_preview_sub.add_parser(preview_action, help=help_text)
+        p_preview.add_argument("--widget-class", required=True, help="Widget class or WidgetBlueprint asset path")
+        p_preview.add_argument("--pie-index", type=int, help="PIE instance index")
+        p_preview.add_argument("--viewport-z-order", type=int, help="Viewport Z order")
+        p_preview.add_argument("--capture-after", action="store_true", help="Return a capture recommendation")
+        p_preview.set_defaults(func=preview_func)
+    p_preview_remove = umg_preview_sub.add_parser("remove", help="Remove tool-owned preview widgets")
+    p_preview_remove.add_argument("--preview-handle", help="Specific preview handle returned by umg preview create/replace")
+    p_preview_remove.add_argument("--pie-index", type=int, help="PIE instance index")
+    p_preview_remove.set_defaults(func=cmd_umg_preview_remove)
+    p_preview_list = umg_preview_sub.add_parser("list", help="List runtime widgets and tool-owned preview count")
+    p_preview_list.add_argument("--pie-index", type=int, help="PIE instance index")
+    p_preview_list.set_defaults(func=cmd_umg_preview_list)
+
+    p_umg_verify = umg_sub.add_parser("verify", help="Verify runtime UMG widgets")
+    umg_verify_sub = p_umg_verify.add_subparsers(dest="verify_action", required=True)
+    p_verify_widgets = umg_verify_sub.add_parser("widgets", help="Verify expected runtime widget names")
+    p_verify_widgets.add_argument("--root-widget", help="Runtime root widget name")
+    p_verify_widgets.add_argument("--expected-widgets", help="Expected widget names JSON array")
+    p_verify_widgets.add_argument("--expected-widgets-file", help="Path to expected widget names JSON array")
+    p_verify_widgets.add_argument("--pie-index", type=int, help="PIE instance index")
+    p_verify_widgets.set_defaults(func=cmd_umg_verify_widgets)
+    p_verify_text = umg_verify_sub.add_parser("text", help="Verify expected runtime TextBlock strings")
+    p_verify_text.add_argument("--root-widget", help="Runtime root widget name")
+    p_verify_text.add_argument("--expected-text", help="Expected TextBlock strings JSON array")
+    p_verify_text.add_argument("--expected-text-file", help="Path to expected text JSON array")
+    p_verify_text.add_argument("--pie-index", type=int, help="PIE instance index")
+    p_verify_text.set_defaults(func=cmd_umg_verify_text)
+    p_verify_nav = umg_verify_sub.add_parser("navigation", help="Verify runtime navigation click sequence")
+    p_verify_nav.add_argument("--root-widget", help="Runtime root widget name")
+    p_verify_nav.add_argument("--click-sequence", help="Click sequence JSON array")
+    p_verify_nav.add_argument("--click-sequence-file", help="Path to click sequence JSON array")
+    p_verify_nav.add_argument("--pie-index", type=int, help="PIE instance index")
+    p_verify_nav.set_defaults(func=cmd_umg_verify_navigation)
+    p_verify_runtime_layout = umg_verify_sub.add_parser("runtime-layout", help="Verify runtime layout against expected layout JSON")
+    p_verify_runtime_layout.add_argument("expected_layout", help="Expected normalized layout JSON path")
+    p_verify_runtime_layout.add_argument("actual_layout", help="Actual normalized layout JSON path")
+    p_verify_runtime_layout.add_argument("--mode", choices=["geometry", "pixel", "both"], default="geometry", help="Comparison mode")
+    p_verify_runtime_layout.add_argument("--subset", action="store_true", help="Ignore extra actual widgets")
+    p_verify_runtime_layout.add_argument("--bounds-tolerance", type=float, default=0.02, help="Normalized bounds tolerance")
+    p_verify_runtime_layout.add_argument("--opacity-tolerance", type=float, default=0.05, help="Opacity tolerance")
+    p_verify_runtime_layout.add_argument("--ignore-mask", action="append", help="Widget name, JSON object/list, or JSON file path to ignore")
+    p_verify_runtime_layout.add_argument("--crop", metavar="X,Y,W,H", help="Crop captured image for pixel comparison")
+    p_verify_runtime_layout.add_argument("--threshold", type=float, default=0.9, help="Pixel similarity threshold")
+    p_verify_runtime_layout.add_argument("--annotated-output", metavar="PATH", help="Optional annotated pixel diff output")
+    p_verify_runtime_layout.add_argument("--reference-image", metavar="PATH", help="Reference image for --mode both")
+    p_verify_runtime_layout.add_argument("--captured-image", metavar="PATH", help="Captured image for --mode both")
+    p_verify_runtime_layout.add_argument("--output", dest="output_file", metavar="PATH", help="Optional path to write comparison report JSON")
+    p_verify_runtime_layout.set_defaults(func=cmd_umg_layout, layout_action="compare")
+
+    p_umg_layout = umg_sub.add_parser("layout", help="Extract, compare, or fit UMG layout artifacts")
+    p_umg_layout.set_defaults(func=cmd_umg_layout)
+    umg_layout_sub = p_umg_layout.add_subparsers(dest="layout_action", required=True)
+    p_umg_layout_extract = umg_layout_sub.add_parser("extract", help="Extract a normalized layout artifact")
+    p_umg_layout_extract.add_argument("--source", choices=["designer", "runtime", "figma", "concept-image"], required=True, help="Layout source")
+    p_umg_layout_extract.add_argument("--input", metavar="PATH", help="Concept image or Figma/Stitch JSON input path")
+    p_umg_layout_extract.add_argument("--asset-path", metavar="PATH", help="Widget Blueprint asset path for designer extraction")
+    p_umg_layout_extract.add_argument("--root-widget", metavar="NAME", help="Runtime root widget name for runtime extraction")
+    p_umg_layout_extract.add_argument("--pie-index", type=int, default=0, help="PIE instance index")
+    p_umg_layout_extract.add_argument("--depth-limit", type=int, default=12, help="Designer widget tree depth limit")
+    p_umg_layout_extract.add_argument("--canvas-size", metavar="W,H", help="Canvas size used for normalized bounds")
+    p_umg_layout_extract.add_argument("--full-geometry", action="store_true", help="Request full runtime and Slate geometry")
+    p_umg_layout_extract.add_argument("--min-region-area", type=int, default=64, help="Minimum concept-image foreground region area")
+    p_umg_layout_extract.add_argument("--output", dest="output_file", metavar="PATH", help="Optional path to write normalized layout JSON")
+    p_umg_layout_extract.set_defaults(func=cmd_umg_layout)
+    p_umg_layout_compare = umg_layout_sub.add_parser("compare", help="Compare layout or pixel artifacts")
+    p_umg_layout_compare.add_argument("expected_layout", help="Expected layout JSON path, or reference image for --mode pixel")
+    p_umg_layout_compare.add_argument("actual_layout", help="Actual layout JSON path, or captured image for --mode pixel")
+    p_umg_layout_compare.add_argument("--mode", choices=["geometry", "pixel", "both"], default="geometry", help="Comparison mode")
+    p_umg_layout_compare.add_argument("--subset", action="store_true", help="Only compare expected widgets and ignore extra actual widgets")
+    p_umg_layout_compare.add_argument("--ignore-mask", action="append", help="Widget name, JSON object/list, or JSON file path to ignore")
+    p_umg_layout_compare.add_argument("--bounds-tolerance", type=float, default=0.02, help="Normalized bounds tolerance")
+    p_umg_layout_compare.add_argument("--opacity-tolerance", type=float, default=0.05, help="Opacity tolerance")
+    p_umg_layout_compare.add_argument("--crop", metavar="X,Y,W,H", help="Crop captured image for pixel comparison")
+    p_umg_layout_compare.add_argument("--threshold", type=float, default=0.9, help="Pixel similarity threshold")
+    p_umg_layout_compare.add_argument("--annotated-output", metavar="PATH", help="Optional annotated pixel diff output")
+    p_umg_layout_compare.add_argument("--reference-image", metavar="PATH", help="Reference image for --mode both")
+    p_umg_layout_compare.add_argument("--captured-image", metavar="PATH", help="Captured image for --mode both")
+    p_umg_layout_compare.add_argument("--output", dest="output_file", metavar="PATH", help="Optional path to write comparison report JSON")
+    p_umg_layout_compare.set_defaults(func=cmd_umg_layout)
+    p_umg_layout_fit = umg_layout_sub.add_parser("fit", help="Emit a corrected apply-widget-tree spec from layout deltas")
+    p_umg_layout_fit.add_argument("--concept", required=True, help="Concept or expected normalized layout JSON")
+    p_umg_layout_fit.add_argument("--actual", required=True, help="Runtime or actual normalized layout JSON")
+    p_umg_layout_fit.add_argument("--spec", required=True, help="Current apply-widget-tree JSON spec")
+    p_umg_layout_fit.add_argument("--output", metavar="PATH", help="Optional path to write corrected apply-widget-tree JSON")
+    p_umg_layout_fit.set_defaults(func=cmd_umg_layout)
+
+    p_umg_workflow = umg_sub.add_parser("workflow", help="Run UMG workflow plans")
+    umg_workflow_sub = p_umg_workflow.add_subparsers(dest="workflow_action", required=True)
+    p_umg_workflow_run = umg_workflow_sub.add_parser("run", help="Run a UMG workflow JSON plan")
+    p_umg_workflow_run.add_argument("--plan", required=True, help="Path to a UMG workflow JSON plan")
+    p_umg_workflow_run.set_defaults(func=cmd_umg_workflow_run)
 
     # -------------------------------------------------------------------------
     # Editor tools — Material
@@ -4008,6 +5440,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_ps.add_argument(
         "--timeout", type=float, metavar="SEC", help="Timeout waiting for PIE ready (for start, default: 30)"
     )
+    p_ps.add_argument(
+        "--blueprint-error-action",
+        choices=["modal", "report", "cancel", "continue"],
+        help="How start handles loaded Blueprint compile errors: modal (default), report, cancel, or continue",
+    )
+    p_ps.add_argument(
+        "--continue-on-blueprint-compile-errors",
+        action="store_true",
+        help="Suppress the Blueprint compile-error modal and continue PIE start after reporting blockers",
+    )
+    p_ps.add_argument(
+        "--preflight-blueprints",
+        action="store_true",
+        help="Report loaded Blueprint compile errors before PIE start policy is applied",
+    )
     p_ps.add_argument("--include", metavar="LIST", help="Comma-separated: world,players (for get-state)")
     p_ps.add_argument("--actor-name", metavar="NAME", help="Actor to monitor (for wait-for)")
     p_ps.add_argument("--property", metavar="PROP", help="Property to check (for wait-for)")
@@ -4018,6 +5465,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_ps.add_argument("--expected", metavar="JSON", help="Expected value as JSON (for wait-for)")
     p_ps.add_argument("--wait-timeout", type=float, metavar="SEC", help="Timeout for wait-for (default: 10)")
+    p_ps.add_argument(
+        "--no-cleanup-tool-previews",
+        action="store_true",
+        help="Do not remove tool-owned UMG previews before stopping PIE",
+    )
     p_ps.set_defaults(func=cmd_pie_session)
 
     p_pt = sub.add_parser(
@@ -4040,21 +5492,69 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_iai = sub.add_parser(
         "inspect-anim-instance",
-        help="One-shot snapshot of a target actor's UAnimInstance.",
+        help="Inspect runtime UAnimInstance state or static AnimBlueprint topology.",
         description=(
-            "Read UAnimInstance runtime state.\n\n"
+            "Read UAnimInstance runtime state from an actor, or inspect static AnimBlueprint topology by asset path.\n\n"
             "EXAMPLES:\n"
             "  soft-ue-cli inspect-anim-instance --actor-tag TestCharacter\n"
+            "  soft-ue-cli inspect-anim-instance --asset-path /Game/Animation/ABP_Player --include topology,sync_groups\n"
             "  soft-ue-cli inspect-anim-instance --actor-tag TestCharacter --include state_machines,montages\n"
             "  soft-ue-cli inspect-anim-instance --actor-tag TestCharacter --blend-weights LayerAim,LayerLocomotion"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_iai.add_argument("--actor-tag", required=True, metavar="TAG", help="Actor tag to search for")
+    p_iai.add_argument("--actor-tag", metavar="TAG", help="Actor tag to search for runtime inspection")
+    p_iai.add_argument("--asset-path", metavar="PATH", help="AnimBlueprint asset path for static topology inspection")
     p_iai.add_argument("--mesh-component", metavar="NAME", help="Named SkeletalMeshComponent (default: first found)")
-    p_iai.add_argument("--include", metavar="LIST", help="Comma-separated sections: state_machines,montages,notifies,blend_weights")
+    p_iai.add_argument(
+        "--include",
+        metavar="LIST",
+        help="Comma-separated sections: topology,sync_groups,state_machines,montages,notifies,blend_weights",
+    )
     p_iai.add_argument("--blend-weights", metavar="LIST", help="Comma-separated UAnimInstance float property names to read")
     p_iai.set_defaults(func=cmd_inspect_anim_instance)
+
+    p_ism = sub.add_parser(
+        "inspect-sync-markers",
+        help="List AuthoredSyncMarkers for an AnimSequence.",
+        description="Inspect sync markers on an AnimSequence asset.",
+    )
+    p_ism.add_argument("asset_path", help="AnimSequence asset path")
+    p_ism.set_defaults(func=cmd_inspect_sync_markers)
+
+    p_csm = sub.add_parser(
+        "compare-sync-markers",
+        help="Compare sync marker names and timing across AnimSequences.",
+        description="Compare sync markers across two or more AnimSequence assets.",
+    )
+    p_csm.add_argument("asset_paths", nargs="+", help="AnimSequence asset paths to compare")
+    p_csm.add_argument("--marker", metavar="NAME", help="Optional marker name filter")
+    p_csm.set_defaults(func=cmd_compare_sync_markers)
+
+    p_asm = sub.add_parser(
+        "add-sync-marker",
+        help="Add an AuthoredSyncMarker to an AnimSequence.",
+        description="Add a sync marker to an AnimSequence asset.",
+    )
+    p_asm.add_argument("asset_path", help="AnimSequence asset path")
+    p_asm.add_argument("marker", help="Marker name")
+    p_asm.add_argument("time", type=float, help="Marker time in seconds")
+    p_asm.add_argument("--save", action="store_true", help="Save the asset after mutation")
+    p_asm.add_argument("--checkout", action="store_true", help="Checkout the asset before mutation when source control is active")
+    p_asm.set_defaults(func=cmd_add_sync_marker)
+
+    p_rsm = sub.add_parser(
+        "remove-sync-marker",
+        help="Remove AuthoredSyncMarkers from an AnimSequence.",
+        description="Remove sync markers from an AnimSequence by name, optionally near a specific time.",
+    )
+    p_rsm.add_argument("asset_path", help="AnimSequence asset path")
+    p_rsm.add_argument("marker", help="Marker name")
+    p_rsm.add_argument("--time", type=float, help="Only remove markers near this time")
+    p_rsm.add_argument("--tolerance", type=float, help="Time tolerance in seconds when --time is provided")
+    p_rsm.add_argument("--save", action="store_true", help="Save the asset after mutation")
+    p_rsm.add_argument("--checkout", action="store_true", help="Checkout the asset before mutation when source control is active")
+    p_rsm.set_defaults(func=cmd_remove_sync_marker)
 
     p_ipp = sub.add_parser(
         "inspect-pawn-possession",
@@ -4448,6 +5948,91 @@ def build_parser() -> argparse.ArgumentParser:
     p_irw.add_argument("--no-properties", action="store_true", help="Exclude widget properties")
     p_irw.add_argument("--root-widget", metavar="NAME", help="Start traversal from a specific widget")
     p_irw.set_defaults(func=cmd_inspect_runtime_widgets)
+
+    p_awt = sub.add_parser(
+        "apply-widget-tree",
+        help="Build or replace a Widget Blueprint designer tree from JSON.",
+        description=(
+            "Builds a nested UMG Designer hierarchy from a declarative JSON spec.\n"
+            "Use --spec for inline JSON or --spec-file for a file. The spec may be\n"
+            '{"root":{"class":"CanvasPanel","name":"Root","children":[...]}} or a root\n'
+            "widget object directly. By default the current designer tree is replaced;\n"
+            "use --append to attach the spec root to the existing root.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli apply-widget-tree /Game/UI/WBP_Menu --spec-file menu_tree.json --compile --save\n"
+            "  soft-ue-cli apply-widget-tree /Game/UI/WBP_Menu --spec '{\"root\":{\"class\":\"CanvasPanel\",\"name\":\"RootCanvas\"}}'\n"
+            "  soft-ue-cli apply-widget-tree /Game/UI/WBP_Menu --spec-file dialog.json --append"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_awt.add_argument("asset_path", help="Widget Blueprint asset path (e.g. /Game/UI/WBP_Menu)")
+    p_awt.add_argument("--spec", metavar="JSON", help="Widget tree spec as a JSON object")
+    p_awt.add_argument("--spec-file", metavar="PATH", help="Path to a JSON widget tree spec file")
+    p_awt.add_argument("--append", action="store_true", help="Append to the existing root instead of replacing it")
+    p_awt.add_argument("--compile", action="store_true", help="Compile the Widget Blueprint after applying the tree")
+    p_awt.add_argument("--save", action="store_true", help="Save the Widget Blueprint after applying the tree")
+    p_awt.add_argument("--checkout", action="store_true", help="Attempt source-control checkout before modifying/saving")
+    p_awt.set_defaults(func=cmd_apply_widget_tree)
+
+    p_wwn = sub.add_parser(
+        "wire-widget-navigation",
+        help="Prepare named UMG button navigation bindings for a reusable parent class.",
+        description=(
+            "Validates button/switcher names in a Widget Blueprint and exposes required\n"
+            "widgets as variables so a reusable parent class can bind clicks by name.\n"
+            "Bindings are a JSON array of objects such as:\n"
+            '  [{"button":"StartButton","mode":"switcher","switcher":"ScreenSwitcher","target_index":1}]\n\n'
+            "EXAMPLES:\n"
+            "  soft-ue-cli wire-widget-navigation /Game/UI/WBP_Menu --bindings-file navigation.json --compile --save\n"
+            "  soft-ue-cli wire-widget-navigation /Game/UI/WBP_Menu --bindings '[{\"button\":\"BackButton\",\"mode\":\"viewport-replace\",\"target_widget_class\":\"/Game/UI/WBP_Main.WBP_Main_C\"}]'"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_wwn.add_argument("asset_path", help="Widget Blueprint asset path (e.g. /Game/UI/WBP_Menu)")
+    p_wwn.add_argument("--bindings", metavar="JSON", help="Navigation bindings as a JSON array")
+    p_wwn.add_argument("--bindings-file", metavar="PATH", help="Path to a JSON array of navigation bindings")
+    p_wwn.add_argument("--compile", action="store_true", help="Compile the Widget Blueprint after preparing bindings")
+    p_wwn.add_argument("--save", action="store_true", help="Save the Widget Blueprint after preparing bindings")
+    p_wwn.add_argument("--checkout", action="store_true", help="Attempt source-control checkout before modifying/saving")
+    p_wwn.add_argument("--allow-pie", action="store_true", help="Allow mutation while PIE is active; by default the tool fails fast during PIE")
+    p_wwn.add_argument(
+        "--allow-busy",
+        action="store_true",
+        help="Allow mutation while the editor is saving or garbage collecting; default is fail-fast",
+    )
+    p_wwn.set_defaults(func=cmd_wire_widget_navigation)
+
+    p_vuw = sub.add_parser(
+        "verify-umg-workflow",
+        help="Validate a UMG workflow in PIE with expected widgets and named button clicks.",
+        description=(
+            "Creates an optional WidgetBlueprint instance in PIE using CreateWidget,\n"
+            "adds it to the viewport, validates named widgets/text, broadcasts named\n"
+            "Button OnClicked events, and checks WidgetSwitcher or visible-widget results.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli verify-umg-workflow --widget-class /Game/UI/WBP_Menu.WBP_Menu_C --expected-widgets '[\"StartButton\"]'\n"
+            "  soft-ue-cli verify-umg-workflow --click-sequence-file clicks.json --capture-after"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_vuw.add_argument("--widget-class", metavar="PATH", help="Widget class or WidgetBlueprint asset path to CreateWidget and add to viewport")
+    p_vuw.add_argument("--root-widget", metavar="NAME", help="Existing runtime root widget name to validate instead of all viewport roots")
+    p_vuw.add_argument("--expected-widgets", metavar="JSON", help="Expected widget names as a JSON array")
+    p_vuw.add_argument("--expected-widgets-file", metavar="PATH", help="Path to expected widget names JSON array")
+    p_vuw.add_argument("--expected-text", metavar="JSON", help="Expected visible text strings as a JSON array")
+    p_vuw.add_argument("--expected-text-file", metavar="PATH", help="Path to expected text JSON array")
+    p_vuw.add_argument("--click-sequence", metavar="JSON", help="Click validation steps as a JSON array")
+    p_vuw.add_argument("--click-sequence-file", metavar="PATH", help="Path to click validation steps JSON array")
+    p_vuw.add_argument("--pie-index", type=int, help="PIE instance index, 0-based (default: 0)")
+    p_vuw.add_argument("--viewport-z-order", type=int, help="Viewport Z order for created preview widget")
+    p_vuw.add_argument("--capture-after", action="store_true", help="Return a capture recommendation after successful verification")
+    p_vuw.add_argument("--remove-preview", action="store_true", help="Remove the preview widget from viewport before returning")
+    p_vuw.add_argument(
+        "--preview-lifecycle",
+        choices=["replace", "keep", "remove"],
+        help="Tool-owned preview lifecycle policy before verification (default: replace)",
+    )
+    p_vuw.set_defaults(func=cmd_verify_umg_workflow)
 
     # -------------------------------------------------------------------------
     # Editor tools — Write
@@ -5451,6 +7036,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output file path (default: auto-generated in Saved/Traces/)",
     )
     p_rw_save.set_defaults(func=cmd_rewind_save)
+
+    _add_canonical_command_families(sub)
+    _remove_top_level_commands(sub, set(REMOVED_COMMAND_MIGRATIONS))
 
     return parser
 

@@ -4,8 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "soft-ue-cli"
-version = "1.31.0"
+version = "1.34.0"
 description = "CLI tool for controlling Unreal Engine via soft-ue-bridge plugin"
+readme = "README.md"
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -16,6 +17,7 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.27",
+    "Pillow>=10",
 ]
 
 [project.scripts]
@@ -43,6 +45,8 @@ packages = ["soft_ue_cli"]
 "soft_ue_cli/skills/author-anim-state-test.md" = "soft_ue_cli/skills/author-anim-state-test.md"
 "soft_ue_cli/skills/author-bp-parity-test.md" = "soft_ue_cli/skills/author-bp-parity-test.md"
 "soft_ue_cli/skills/author-invariant-test.md" = "soft_ue_cli/skills/author-invariant-test.md"
+"soft_ue_cli/skills/author-umg-designer.md" = "soft_ue_cli/skills/author-umg-designer.md"
+"soft_ue_cli/skills/author-umg-workflow.md" = "soft_ue_cli/skills/author-umg-workflow.md"
 "soft_ue_cli/skills/plan-test-infrastructure.md" = "soft_ue_cli/skills/plan-test-infrastructure.md"
 "soft_ue_cli/skills/setup-test-infrastructure.md" = "soft_ue_cli/skills/setup-test-infrastructure.md"
 "soft_ue_cli/skills/level-from-image.md" = "soft_ue_cli/skills/level-from-image.md"
