@@ -5,14 +5,17 @@ All notable changes to soft-ue-cli will be documented in this file.
 ## [Fork · ShineTheSky · v1.34.0-fork.1]
 
 ### Added
-- **ModifyEnumTool** -- programmatic enum modification for UE enums.
-- **CreateBlueprintFromJsonTool** -- create Blueprints from JSON with SCS component tree and component property support.
-- **CreateBehaviorTreeFromJsonTool** -- create Behavior Trees from JSON with DSL compiler support.
-- **QueryBehaviorTreeTool** -- query Behavior Trees with blackboard key resolution.
-- **QueryBlueprintGraphTool** -- enhanced with full K2Node support (CallFunction, Event, Variable, Macro, Timeline, BreakStruct, etc.).
-- **QueryBlueprintTool** -- enhanced with component and function override introspection.
-- **BridgePropertySerializer** -- reusable property type resolution and serialization for bridge tools.
-- **Python DSL tools** -- `blueprint_json.py`, `bp_json_converter.py`, `bt_dsl_compiler.py`, `bb_json_converter.py` for offline Blueprint/BehaviorTree JSON and DSL handling.
+- **ModifyEnumTool** -- add, remove, or rename enumerators in UserDefinedEnum assets.
+- **CreateBlueprintFromJsonTool** -- create Blueprints from JSON, building both the EventGraph (Events, CallFunction, Variable Get/Set, Branch, Sequence, DynamicCast, Timeline, BreakStruct, etc.) and the SCS component tree with component property initialization.
+- **CreateBehaviorTreeFromJsonTool** -- create Behavior Trees from JSON; paired with `bt_dsl_compiler` which compiles .bttxt indented-text DSL into BT JSON.
+- **QueryBehaviorTreeTool** -- query Behavior Tree assets: blackboard keys, composite tree structure, decorators, services, and per-node UPROPERTY values.
+- **QueryBlueprintGraphTool** -- enhanced with full K2Node query support (Event, CustomEvent, CallFunction, FunctionEntry/Result, Variable Get/Set, DynamicCast, Branch, Sequence, MacroInstance, Timeline, BreakStruct, MakeArray, Tunnel, ComponentBoundEvent, PromotableOperator, BaseAsyncTask, Message) plus Animation Blueprint graph support.
+- **QueryBlueprintTool** -- enhanced with component introspection and function override discovery.
+- **Python tools:**
+  - `blueprint_json.py` -- validate Blueprint JSON structure and route to bridge for creation.
+  - `bp_json_converter.py` -- convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create).
+  - `bt_dsl_compiler.py` -- compile indented-text DSL (.bttxt) to/from Behavior Tree JSON.
+  - `bb_json_converter.py` -- BlackboardData JSON round-trip (parse/export blackboard key definitions).
 
 ## [1.34.0] - 2026-05-25
 
