@@ -43,6 +43,7 @@ soft-ue-cli  (CLI or MCP server)
 - **MCP server + CLI in one package** -- use as an MCP server (`mcp-serve`) for Claude Desktop, Cursor, Windsurf, and other MCP clients, **or** as a standard CLI for Claude Code, shell scripts, and CI/CD. Same 120+ tool surface either way.
 - **AI-native UE automation** -- purpose-built so LLM agents can read, modify, and test Unreal Engine projects without a human touching the editor.
 - **120+ commands and tools** covering actors, Blueprints, materials, StateTrees, Mutable/CustomizableObject, widgets, assets, config files, PIE sessions, profiling, screenshots, and local Unreal file analysis.
+- **120+ commands and tools** covering actors, Blueprints, materials, StateTrees, Mutable/CustomizableObject, widgets, assets, config files, PIE sessions, profiling, screenshots, and local Unreal file analysis.
 - **Canonical command families only** -- UMG, capture, Mutable, StateTree, animation, asset, and Blueprint workflows are grouped under `umg`, `capture`, `mutable`, `statetree`, `anim`, `asset`, and `blueprint`. Removed flat names are discoverable with `commands --include-removed`.
 - **Plugin-aware metadata** -- `soft-ue-cli commands --json` reports bridge/editor/PIE requirements plus optional Unreal plugin dependencies, and bridge tools return structured `plugin_unavailable` errors when a plugin is missing.
 - **Token-aware visual feedback** -- viewport and screenshot capture can resize output by scale, width, or height and can emit color, grayscale, or monochrome images for lower LLM token cost.
@@ -78,6 +79,28 @@ soft-ue-cli is intentionally a different layer rather than a replacement for fir
 - It reports optional plugin requirements and missing-plugin failures in structured JSON so agents can recover instead of guessing.
 
 The two can coexist: use UE's first-party MCP for native UE 5.8 editor coverage when it fits, and use soft-ue-cli for UE 5.7 projects, cooked Development/DebugGame builds, CLI/CI automation, offline inspection, curated workflows, visual capture transforms, optional plugin diagnostics, and bridge tools that move independently of engine releases.
+
+---
+
+## Why This Fork? · ShineTheSky · v1.34.0-fork.1
+
+**Goal:** losslessly convert Blueprint and Behavior Tree assets into structured JSON and DSL formats, enabling LLM agents to batch-read, analyze, diff, and author UE gameplay logic without opening the editor.
+
+This fork extends soft-ue-cli with authoring, introspection, and serialization tools:
+
+- **ModifyEnumTool** — add, remove, or rename enumerators in UserDefinedEnum assets.
+- **CreateBlueprintFromJsonTool** — create Blueprints from JSON, building both the EventGraph (Events, CallFunction, Variable Get/Set, Branch, Sequence, DynamicCast, Timeline, BreakStruct, etc.) and the SCS component tree with component property initialization.
+- **CreateBehaviorTreeFromJsonTool** — create Behavior Trees from JSON; paired with `bt_dsl_compiler` which compiles a human-readable indented-text DSL (.bttxt) into BT JSON.
+- **QueryBehaviorTreeTool** — query Behavior Tree assets: blackboard keys, composite tree structure, decorators, services, and per-node UPROPERTY values.
+- **Enhanced QueryBlueprintGraphTool** — full K2Node query support (Event, CustomEvent, CallFunction, FunctionEntry/Result, Variable Get/Set, DynamicCast, Branch, Sequence, MacroInstance, Timeline, BreakStruct, MakeArray, Tunnel, ComponentBoundEvent, PromotableOperator, BaseAsyncTask, Message) plus Animation Blueprint graph support.
+- **Enhanced QueryBlueprintTool** — component introspection and function override discovery.
+- **Python tools:**
+  - `blueprint_json.py` — validate Blueprint JSON structure and route to bridge for creation.
+  - `bp_json_converter.py` — convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create).
+  - `bt_dsl_compiler.py` — compile indented-text DSL (.bttxt) to/from Behavior Tree JSON.
+  - `bb_json_converter.py` — BlackboardData JSON round-trip (parse/export blackboard key definitions).
+
+All upstream features and commands are preserved. This fork tracks upstream releases and layers its own tools on top. See [CHANGELOG.md](CHANGELOG.md) for details.
 
 ---
 

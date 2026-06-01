@@ -2,6 +2,18 @@
 
 All notable changes to soft-ue-cli will be documented in this file.
 
+## [Fork · ShineTheSky · v1.34.0-fork.1]
+
+### Added
+- **ModifyEnumTool** -- programmatic enum modification for UE enums.
+- **CreateBlueprintFromJsonTool** -- create Blueprints from JSON with SCS component tree and component property support.
+- **CreateBehaviorTreeFromJsonTool** -- create Behavior Trees from JSON with DSL compiler support.
+- **QueryBehaviorTreeTool** -- query Behavior Trees with blackboard key resolution.
+- **QueryBlueprintGraphTool** -- enhanced with full K2Node support (CallFunction, Event, Variable, Macro, Timeline, BreakStruct, etc.).
+- **QueryBlueprintTool** -- enhanced with component and function override introspection.
+- **BridgePropertySerializer** -- reusable property type resolution and serialization for bridge tools.
+- **Python DSL tools** -- `blueprint_json.py`, `bp_json_converter.py`, `bt_dsl_compiler.py`, `bb_json_converter.py` for offline Blueprint/BehaviorTree JSON and DSL handling.
+
 ## [1.34.0] - 2026-05-25
 
 ### Changed
