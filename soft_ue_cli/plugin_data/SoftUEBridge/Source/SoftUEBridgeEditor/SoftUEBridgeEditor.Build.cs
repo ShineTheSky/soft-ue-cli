@@ -32,6 +32,10 @@ public class SoftUEBridgeEditor : ModuleRules
 			"KismetCompiler",
 			"BlueprintGraph",
 
+			// BehaviorTree
+			"AIGraph",
+			"BehaviorTreeEditor",
+
 			// Animation Blueprint
 			"AnimGraph",
 

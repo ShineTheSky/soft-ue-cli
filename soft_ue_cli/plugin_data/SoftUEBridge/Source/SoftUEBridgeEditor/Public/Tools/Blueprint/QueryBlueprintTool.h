@@ -1,4 +1,5 @@
 // Copyright softdaddy-o 2024. All Rights Reserved.
+// Copyright ShineTheSky 2026. All Rights Reserved.
 
 #pragma once
 
@@ -49,6 +50,9 @@ private:
 
 	/** Extract implemented interfaces */
 	TSharedPtr<FJsonObject> ExtractInterfaces(class UBlueprint* Blueprint) const;
+
+	/** Extract timelines */
+	TSharedPtr<FJsonObject> ExtractTimelines(class UBlueprint* Blueprint) const;
 
 	// === Helpers ===
 

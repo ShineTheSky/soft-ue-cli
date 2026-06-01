@@ -31,6 +31,35 @@ def _fix_msys_asset_path(path: str) -> str:
     return path
 
 
+def _write_next_to_asset(ue_path: str, save_path: str, content: str, ext: str, force: bool = False) -> None:
+    """Resolve a UE asset path to filesystem and write content alongside it.
+
+    ue_path:  e.g. /Game/Blueprints/BP_Player
+    save_path: project root (or '.' for auto-detect from CWD)
+    ext:       file extension, e.g. '.dsl' or '.bttxt'
+    force:     overwrite existing file without prompting
+    """
+    # Resolve project root
+    root = Path(save_path).expanduser().resolve()
+    if root.name == '.' or not (root / "Content").exists():
+        for parent in Path.cwd().parents:
+            if (parent / "Content").is_dir():
+                root = parent
+                break
+        else:
+            print(f"error: cannot find project root (no Content/ dir). Use --save <project-root>", file=sys.stderr)
+            sys.exit(1)
+
+    rel = ue_path.replace("/Game/", "", 1) if ue_path.startswith("/Game/") else ue_path.lstrip("/")
+    out = root / "Content" / (rel + ext)
+    if out.exists() and not force:
+        print(f"error: {out} already exists. Use --force to overwrite.", file=sys.stderr)
+        sys.exit(1)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(content, encoding="utf-8")
+    print(f"Saved: {out}")
+
+
 def _print_json(data: object) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
@@ -501,6 +530,18 @@ def cmd_query_enum(args: argparse.Namespace) -> None:
     _print_json(_run_tool("query-enum", {"asset_path": args.asset_path}))
 
 
+def cmd_modify_enum(args: argparse.Namespace) -> None:
+    """Modify a UserDefinedEnum: add, remove, or rename enumerators."""
+    payload: dict = {
+        "asset_path": args.asset_path,
+        "action": args.action,
+        "name": args.name,
+    }
+    if getattr(args, "new_name", None):
+        payload["new_name"] = args.new_name
+    _print_json(_run_tool("modify-enum", payload))
+
+
 def cmd_query_struct(args: argparse.Namespace) -> None:
     _print_json(_run_tool("query-struct", {"asset_path": args.asset_path}))
 
@@ -808,6 +849,224 @@ def cmd_query_blueprint_graph(args: argparse.Namespace) -> None:
     if args.include_anim_props:
         arguments["include_anim_node_properties"] = True
     _print_json(_run_tool("query-blueprint-graph", arguments))
+
+
+def cmd_validate_blueprint_json(args: argparse.Namespace) -> None:
+    """Validate a Blueprint JSON description file (offline, no UE required)."""
+    from .blueprint_json import format_validation_result, validate_blueprint_json_file
+
+    json_path = getattr(args, "json_path", "")
+    try:
+        result = validate_blueprint_json_file(json_path)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    report = format_validation_result(result)
+    print(report)
+
+    if not result.is_valid:
+        sys.exit(1)
+
+
+
+
+def cmd_blueprint_to_json(args: argparse.Namespace) -> None:
+	"""Read a Blueprint from UE and output unified JSON (compatible with create-blueprint-from-json)."""
+	from .bp_json_converter import convert_to_create_json
+
+	asset_path = getattr(args, "asset_path", "")
+	output_path = getattr(args, "output", None)
+
+	bp_json = _run_tool("query-blueprint", {
+		"asset_path": asset_path,
+		"include": "all",
+		"include_inherited": True,
+	})
+	bp_json["component_overrides"] = _run_tool("query-blueprint", {
+		"asset_path": asset_path,
+		"include": "component_overrides",
+	}).get("component_overrides", {})
+
+	graph_json = _run_tool("query-blueprint-graph", {
+		"asset_path": asset_path,
+		"include_positions": True,
+	})
+
+	description = getattr(args, "description", None) or ""
+	unified = convert_to_create_json(
+		bp_json, graph_json,
+		asset_path=asset_path,
+		description=description,
+	)
+
+	import json
+	output_text = json.dumps(unified, indent=2, ensure_ascii=False)
+
+	save_path = getattr(args, "save", None)
+	if save_path:
+		_write_next_to_asset(asset_path, save_path, output_text, ".json", force=args.force)
+	elif output_path:
+		with open(output_path, "w", encoding="utf-8") as f:
+			f.write(output_text)
+		print(f"Saved to {output_path}")
+	else:
+		print(output_text)
+
+
+
+
+def cmd_blackboard_to_json(args: argparse.Namespace) -> None:
+    """Read a BlackboardData asset and output clean JSON."""
+    from .bb_json_converter import query_blackboard
+
+    asset_path = getattr(args, "asset_path", "")
+    result = query_blackboard(asset_path)
+
+    import json
+    output_text = json.dumps(result, indent=2, ensure_ascii=False)
+
+    save_path = getattr(args, "save", None)
+    output_path = getattr(args, "output", None)
+    if save_path:
+        _write_next_to_asset(asset_path, save_path, output_text, ".json", force=args.force)
+    elif output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(output_text)
+        print(f"Saved to {output_path}")
+    else:
+        print(output_text)
+
+
+def cmd_create_blackboard_from_json(args: argparse.Namespace) -> None:
+    """Create a BlackboardData asset from JSON."""
+    from .bb_json_converter import build_create_script
+
+    json_path = getattr(args, "json_path", "")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    asset_path = getattr(args, "asset_path", None)
+    target_path = asset_path or data.get("path", data.get("asset_path", ""))
+
+    # Step 1: Create empty BlackboardData
+    create_result = _run_tool("create-asset", {
+        "asset_path": target_path,
+        "asset_class": "BlackboardData",
+    })
+    if not create_result.get("success"):
+        print(f"error: Failed to create asset: {create_result}", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 2: Populate keys via Python
+    script = build_create_script(data, asset_path=target_path)
+    py_result = _run_tool("run-python-script", {"script": script})
+    if not py_result.get("success"):
+        print(f"error: Key population failed: {py_result.get('error', 'unknown')}", file=sys.stderr)
+        sys.exit(1)
+
+    # Step 3: Re-read to verify
+    from .bb_json_converter import query_blackboard
+    result = query_blackboard(target_path)
+    result["success"] = True
+    _print_json(result)
+
+
+def cmd_query_behavior_tree(args: argparse.Namespace) -> None:
+    """Query a BehaviorTree via UE bridge and output JSON."""
+    asset_path = getattr(args, "asset_path", "")
+    _print_json(_run_tool("query-behaviortree", {"asset_path": asset_path}))
+
+
+def cmd_behavior_tree_to_text(args: argparse.Namespace) -> None:
+    """Query BehaviorTree from UE and output indented text."""
+    from .bt_dsl_compiler import decompile_bt_json_to_text
+
+    data = _run_tool("query-behaviortree", {"asset_path": args.asset_path})
+    from datetime import datetime
+    bb = data.get("blackboard", {})
+    header = (
+        f"---\n"
+        f"name: {data.get('name', args.asset_path)}\n"
+        f"type: BehaviorTree\n"
+        f"asset: {data.get('path', args.asset_path)}\n"
+        f"blackboard: {bb.get('path', '-')}\n"
+        f"keys: {bb.get('key_count', 0)}\n"
+        f"date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"---\n"
+    )
+    output = header + decompile_bt_json_to_text(data)
+
+    save_path = getattr(args, "save", None)
+    if save_path:
+        _write_next_to_asset(args.asset_path, save_path, output, ".bttxt", force=args.force)
+    else:
+        print(output)
+
+
+def cmd_create_behavior_tree_from_text(args: argparse.Namespace) -> None:
+    """Read .bttxt file, compile to JSON, create BehaviorTree via UE bridge."""
+    from .bt_dsl_compiler import compile_bt_file, BTParseError
+
+    bt_path = getattr(args, "bt_path", "")
+    asset_path = getattr(args, "asset_path", None)
+
+    try:
+        payload = compile_bt_file(bt_path)
+    except (FileNotFoundError, BTParseError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if asset_path:
+        payload["asset_path"] = asset_path
+    elif "name" in payload and "asset_path" not in payload:
+        payload["asset_path"] = f"/Game/AI/{payload['name']}"
+
+    _print_json(_run_tool("create-behaviortree-from-json", payload))
+
+
+def cmd_validate_bt_text(args: argparse.Namespace) -> None:
+    """Validate a .bttxt file (offline)."""
+    from .bt_dsl_compiler import validate_bt_file
+
+    bt_path = getattr(args, "bt_path", "")
+    try:
+        result = validate_bt_file(bt_path)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    if not result.issues:
+        print("BT validation passed - no errors or warnings.")
+    else:
+        for issue in result.issues:
+            loc = f"line {issue.line_no}: " if issue.line_no else ""
+            print(f"{issue.severity.upper()}: {loc}{issue.message}")
+        print(f"\n{len(result.errors)} error(s), {len(result.warnings)} warning(s)")
+
+    if not result.is_valid:
+        sys.exit(1)
+
+
+def cmd_create_blueprint_from_json(args: argparse.Namespace) -> None:
+    """Read a Blueprint JSON description and create the Blueprint via the UE bridge."""
+    json_path = getattr(args, "json_path", "")
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    asset_path = getattr(args, "asset_path", None)
+    if asset_path:
+        data["asset_path"] = asset_path
+
+    _print_json(_run_tool("create-blueprint-from-json", data))
 
 
 def cmd_inspect_uasset(args: argparse.Namespace) -> None:
@@ -3044,6 +3303,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_qe.add_argument("asset_path", help="UserDefinedEnum asset path")
     p_qe.set_defaults(func=cmd_query_enum)
 
+    p_me = sub.add_parser(
+        "modify-enum",
+        help="Add, remove, or rename enumerators in a UserDefinedEnum.",
+        description=(
+            "Modifies a UserDefinedEnum asset. Supports three actions:\n"
+            "  add     - Add a new enumerator\n"
+            "  remove  - Remove an existing enumerator\n"
+            "  rename  - Rename an existing enumerator\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli modify-enum /Game/Data/E_State --action add --name Flee\n"
+            "  soft-ue-cli modify-enum /Game/Data/E_State --action remove --name OldValue\n"
+            "  soft-ue-cli modify-enum /Game/Data/E_State --action rename --name Chase --new-name Pursuit"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_me.add_argument("asset_path", help="UserDefinedEnum asset path")
+    p_me.add_argument("--action", required=True, choices=["add", "remove", "rename"],
+                      help="Action to perform")
+    p_me.add_argument("--name", required=True, help="Enumerator name (for add: new name, for remove: name to remove, for rename: old name)")
+    p_me.add_argument("--new-name", help="For rename: new authored name")
+    p_me.set_defaults(func=cmd_modify_enum)
+
     p_qs = sub.add_parser(
         "query-struct",
         help="Inspect a UserDefinedStruct asset.",
@@ -4565,6 +4846,194 @@ def build_parser() -> argparse.ArgumentParser:
     p_snpr.add_argument("node_guid", help="Node GUID (from query-blueprint-graph)")
     p_snpr.add_argument("properties", help="Properties as JSON object")
     p_snpr.set_defaults(func=cmd_set_node_property)
+
+    # -------------------------------------------------------------------------
+    # Blueprint JSON validation and creation
+    # -------------------------------------------------------------------------
+
+    p_vbj = sub.add_parser(
+        "validate-blueprint-json",
+        help="Validate a Blueprint JSON description file (offline, no UE required).",
+        description=(
+            "Checks the structure of a Blueprint JSON description for correctness\n"
+            "before sending it to the UE bridge for creation.\n\n"
+            "Validates: structure, node types, pin names, connection integrity,\n"
+            "variable references, exec/data pin polarity.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli validate-blueprint-json my_blueprint.json\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_vbj.add_argument("json_path", help="Path to the Blueprint JSON description file")
+    p_vbj.set_defaults(func=cmd_validate_blueprint_json)
+
+    p_b2j = sub.add_parser(
+        "blueprint-to-json",
+        help="Read a Blueprint from UE and output unified JSON (requires UE bridge).",
+        description="Queries a Blueprint and outputs unified JSON compatible with create-blueprint-from-json.\n\nEXAMPLES:\n  soft-ue-cli blueprint-to-json /Game/Blueprints/BP_Player\n  soft-ue-cli blueprint-to-json /Game/Blueprints/BP_Player -o bp.json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_b2j.add_argument("asset_path", help="Blueprint asset path (e.g., /Game/Blueprints/BP_Player)")
+    p_b2j.add_argument(
+        "-o", "--output", metavar="FILE",
+        help="Write JSON to file instead of stdout."
+    )
+    p_b2j.add_argument(
+        "--description", metavar="TEXT",
+        help="Human-readable description for the _header."
+    )
+    p_b2j.add_argument(
+        "--save", metavar="PROJECT_ROOT", nargs="?", const=".",
+        help="Save .json file alongside the .uasset instead of printing to stdout."
+    )
+    p_b2j.add_argument(
+        "--force", action="store_true",
+        help="Overwrite existing .json file without prompting."
+    )
+    p_b2j.set_defaults(func=cmd_blueprint_to_json)
+
+
+    # ── Blackboard commands ──────────────────────────────────────────────
+
+    p_qbb = sub.add_parser(
+        "blackboard-to-json",
+        help="Read a BlackboardData asset and output clean JSON.",
+        description=(
+            "Queries a BlackboardData asset via the bridge and outputs a clean\n"
+            "JSON representation with parsed keys, ready for round-trip.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli blackboard-to-json /Game/AI/Blackboard/BL_Enemy\n"
+            "  soft-ue-cli blackboard-to-json /Game/AI/Blackboard/BL_Enemy -o bb.json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_qbb.add_argument("asset_path", help="BlackboardData asset path")
+    p_qbb.add_argument(
+        "-o", "--output", metavar="FILE",
+        help="Write JSON to file instead of stdout."
+    )
+    p_qbb.add_argument(
+        "--save", metavar="PROJECT_ROOT", nargs="?", const=".",
+        help="Save .json file alongside the .uasset instead of printing to stdout."
+    )
+    p_qbb.add_argument(
+        "--force", action="store_true",
+        help="Overwrite existing .json file without prompting."
+    )
+    p_qbb.set_defaults(func=cmd_blackboard_to_json)
+
+    p_cbb = sub.add_parser(
+        "create-blackboard-from-json",
+        help="Create a BlackboardData asset from a JSON description.",
+        description=(
+            "Creates a BlackboardData asset from a JSON file (produced by\n"
+            "blackboard-to-json or handwritten). Keys are populated with the\n"
+            "correct key-type subobjects.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli create-blackboard-from-json my_bb.json\n"
+            "  soft-ue-cli create-blackboard-from-json my_bb.json --asset-path /Game/AI/BB_New"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_cbb.add_argument("json_path", help="Path to JSON file describing the blackboard")
+    p_cbb.add_argument(
+        "--asset-path", metavar="PATH",
+        help="Override the asset path in the JSON (e.g., /Game/AI/BB_Copy)"
+    )
+    p_cbb.set_defaults(func=cmd_create_blackboard_from_json)
+
+    # ── Behavior Tree commands ──────────────────────────────────────────
+
+    p_qbt = sub.add_parser(
+        "query-behaviortree",
+        help="Query a BehaviorTree asset and output JSON (requires UE bridge).",
+        description=(
+            "Reads a BehaviorTree asset and outputs the full tree structure as JSON:\n"
+            "blackboard keys, composite hierarchy, decorators, services, and node properties.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli query-behaviortree /Game/AI/BT_Enemy\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_qbt.add_argument("asset_path", help="BehaviorTree asset path")
+    p_qbt.set_defaults(func=cmd_query_behavior_tree)
+
+    p_btt = sub.add_parser(
+        "behavior-tree-to-text",
+        help="Query BehaviorTree and output indented text (requires UE bridge).",
+        description=(
+            "Reads a BehaviorTree via the bridge and decompiles it to\n"
+            "human-readable indented text format.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli behavior-tree-to-text /Game/AI/BT_Boss\n"
+            "  soft-ue-cli behavior-tree-to-text /Game/AI/BT_Boss > BT_Boss.bttxt\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_btt.add_argument("asset_path", help="BehaviorTree asset path")
+    p_btt.add_argument(
+        "--save", metavar="PROJECT_ROOT", nargs="?", const=".",
+        help="Save .bttxt file alongside the .uasset instead of printing to stdout."
+    )
+    p_btt.add_argument(
+        "--force", action="store_true",
+        help="Overwrite existing .bttxt file without prompting."
+    )
+    p_btt.set_defaults(func=cmd_behavior_tree_to_text)
+
+    p_cbtt = sub.add_parser(
+        "create-behavior-tree-from-text",
+        help="Create a BehaviorTree from a .bttxt file (requires UE bridge).",
+        description=(
+            "Reads a .bttxt file, compiles it to JSON, and creates the\n"
+            "complete BehaviorTree in UE via a single bridge call.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli create-behavior-tree-from-text my_tree.bttxt\n"
+            "  soft-ue-cli create-behavior-tree-from-text my_tree.bttxt --asset-path /Game/AI/BT_New\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_cbtt.add_argument("bt_path", help="Path to the .bttxt file")
+    p_cbtt.add_argument(
+        "--asset-path", metavar="PATH",
+        help="Override the asset path. Defaults to /Game/AI/<name>.",
+    )
+    p_cbtt.set_defaults(func=cmd_create_behavior_tree_from_text)
+
+    p_vbt = sub.add_parser(
+        "validate-behavior-tree-text",
+        help="Validate a .bttxt file (offline, no UE required).",
+        description=(
+            "Checks behavior tree text syntax and structure.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli validate-behavior-tree-text my_tree.bttxt\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_vbt.add_argument("bt_path", help="Path to the .bttxt file")
+    p_vbt.set_defaults(func=cmd_validate_bt_text)
+
+    p_cbfj = sub.add_parser(
+        "create-blueprint-from-json",
+        help="Create a Blueprint from a JSON description file (requires UE bridge).",
+        description=(
+            "Reads a Blueprint JSON description and creates the Blueprint asset,\n"
+            "variables, graph nodes, and pin connections in one operation.\n\n"
+            "Requires the SoftUEBridge plugin to be running in the UE Editor.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli create-blueprint-from-json my_blueprint.json\n"
+            "  soft-ue-cli create-blueprint-from-json my_blueprint.json --asset-path /Game/Blueprints/BP_New\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_cbfj.add_argument("json_path", help="Path to the Blueprint JSON description file")
+    p_cbfj.add_argument(
+        "--asset-path",
+        metavar="PATH",
+        help="Override the asset path (e.g., /Game/Blueprints/BP_NewAbility). "
+             "If not set, uses the path from the JSON file.",
+    )
+    p_cbfj.set_defaults(func=cmd_create_blueprint_from_json)
 
     # -------------------------------------------------------------------------
     # Offline inspection

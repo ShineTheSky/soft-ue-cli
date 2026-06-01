@@ -1,4 +1,5 @@
 // Copyright softdaddy-o 2024. All Rights Reserved.
+// Copyright ShineTheSky 2026. All Rights Reserved.
 
 #include "Tools/Blueprint/QueryBlueprintTool.h"
 #include "SoftUEBridgeEditorModule.h"
@@ -156,6 +157,20 @@ FBridgeToolResult UQueryBlueprintTool::Execute(
 	}
 	Result->SetStringField(TEXT("blueprint_type"), BlueprintTypeStr);
 
+	// Detect data-only Blueprints (no event graph nodes)
+	bool bIsDataOnly = true;
+	for (UEdGraph* Graph : Blueprint->UbergraphPages)
+	{
+		if (Graph && Graph->Nodes.Num() > 0)
+		{
+			bIsDataOnly = false;
+			break;
+		}
+	}
+	if (Blueprint->UbergraphPages.Num() == 0)
+		bIsDataOnly = true;
+	Result->SetBoolField(TEXT("is_data_only"), bIsDataOnly);
+
 	// Add requested sections
 	bool bAll = Include == TEXT("all");
 
@@ -248,7 +263,7 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractFunctions(UBlueprint* Bluepr
 							ParamObj->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
 							if (Pin->PinType.PinSubCategoryObject.IsValid())
 							{
-								ParamObj->SetStringField(TEXT("sub_type"), Pin->PinType.PinSubCategoryObject->GetName());
+								ParamObj->SetStringField(TEXT("sub_type"), Pin->PinType.PinSubCategoryObject->GetPathName());
 							}
 							ParamsArray.Add(MakeShareable(new FJsonValueObject(ParamObj)));
 						}
@@ -287,7 +302,7 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractVariables(UBlueprint* Bluepr
 
 		if (Var.VarType.PinSubCategoryObject.IsValid())
 		{
-			VarObj->SetStringField(TEXT("sub_type"), Var.VarType.PinSubCategoryObject->GetName());
+			VarObj->SetStringField(TEXT("sub_type"), Var.VarType.PinSubCategoryObject->GetPathName());
 		}
 
 		VarObj->SetBoolField(TEXT("is_array"), Var.VarType.IsArray());
@@ -319,9 +334,18 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractVariables(UBlueprint* Bluepr
 
 			// Flags
 			TArray<TSharedPtr<FJsonValue>> FlagsArray;
-			if (Var.PropertyFlags & CPF_Edit) FlagsArray.Add(MakeShareable(new FJsonValueString(TEXT("EditAnywhere"))));
+			if (Var.PropertyFlags & CPF_Edit)
+			{
+				if (Var.PropertyFlags & CPF_DisableEditOnInstance)
+					FlagsArray.Add(MakeShareable(new FJsonValueString(TEXT("EditDefaultsOnly"))));
+				else if (Var.PropertyFlags & CPF_DisableEditOnTemplate)
+					FlagsArray.Add(MakeShareable(new FJsonValueString(TEXT("EditInstanceOnly"))));
+				else
+					FlagsArray.Add(MakeShareable(new FJsonValueString(TEXT("EditAnywhere"))));
+			}
 			if (Var.PropertyFlags & CPF_BlueprintVisible) FlagsArray.Add(MakeShareable(new FJsonValueString(TEXT("BlueprintReadWrite"))));
-			if (Var.PropertyFlags & CPF_ExposeOnSpawn) FlagsArray.Add(MakeShareable(new FJsonValueString(TEXT("ExposeOnSpawn"))));
+			if ((Var.PropertyFlags & CPF_ExposeOnSpawn) || Var.HasMetaData(FBlueprintMetadata::MD_ExposeOnSpawn))
+				FlagsArray.Add(MakeShareable(new FJsonValueString(TEXT("ExposeOnSpawn"))));
 			VarObj->SetArrayField(TEXT("flags"), FlagsArray);
 		}
 
@@ -473,11 +497,9 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractDefaults(UBlueprint* Bluepri
 
 	// Iterate properties
 	TArray<TSharedPtr<FJsonValue>> PropertiesArray;
-	EFieldIteratorFlags::SuperClassFlags SuperFlags = bIncludeInherited
-		? EFieldIteratorFlags::IncludeSuper
-		: EFieldIteratorFlags::ExcludeSuper;
-
-	for (TFieldIterator<FProperty> PropIt(GenClass, SuperFlags); PropIt; ++PropIt)
+	// Always include super-class properties — the CDO contains all inherited properties
+	// and data-only Blueprints (GE, etc.) have no local properties of their own.
+	for (TFieldIterator<FProperty> PropIt(GenClass, EFieldIteratorFlags::IncludeSuper); PropIt; ++PropIt)
 	{
 		FProperty* Property = *PropIt;
 		if (!Property)
@@ -873,3 +895,4 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractInterfaces(UBlueprint* Bluep
 
 	return Result;
 }
+

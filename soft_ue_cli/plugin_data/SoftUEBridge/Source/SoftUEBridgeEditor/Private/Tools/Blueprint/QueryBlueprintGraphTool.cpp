@@ -1,15 +1,28 @@
 // Copyright softdaddy-o 2024. All Rights Reserved.
+// Copyright ShineTheSky 2026. All Rights Reserved.
 
 #include "Tools/Blueprint/QueryBlueprintGraphTool.h"
 #include "Engine/Blueprint.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
 #include "EdGraph/EdGraphPin.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_Message.h"
+#include "K2Node_BaseAsyncTask.h"
 #include "K2Node_Event.h"
 #include "K2Node_CustomEvent.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
 #include "K2Node_Tunnel.h"
+#include "K2Node_VariableGet.h"
+#include "K2Node_VariableSet.h"
+#include "K2Node_DynamicCast.h"
+#include "K2Node_ComponentBoundEvent.h"
+#include "K2Node_MacroInstance.h"
+#include "K2Node_MakeArray.h"
+#include "K2Node_PromotableOperator.h"
+#include "K2Node_Timeline.h"
+#include "K2Node_BreakStruct.h"
 #include "EdGraphSchema_K2.h"
 #include "Tools/BridgeToolResult.h"
 #include "SoftUEBridgeEditorModule.h"
@@ -467,47 +480,154 @@ TSharedPtr<FJsonObject> UQueryBlueprintGraphTool::NodeToJson(UEdGraphNode* Node,
 
 	TSharedPtr<FJsonObject> NodeJson = MakeShareable(new FJsonObject);
 
-	NodeJson->SetStringField(TEXT("guid"), Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+	NodeJson->SetStringField(TEXT("guid"), Node->GetName());
 	NodeJson->SetStringField(TEXT("class"), Node->GetClass()->GetName());
 	NodeJson->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 
-	if (!Node->NodeComment.IsEmpty())
+	// K2Node_Message extends K2Node_CallFunction — check it first
+	if (UK2Node_Message* MsgNode = Cast<UK2Node_Message>(Node))
 	{
-		NodeJson->SetStringField(TEXT("comment"), Node->NodeComment);
-	}
-
-	if (Options.bIncludePositions)
-	{
-		TSharedPtr<FJsonObject> PositionJson = MakeShareable(new FJsonObject);
-		PositionJson->SetNumberField(TEXT("x"), Node->NodePosX);
-		PositionJson->SetNumberField(TEXT("y"), Node->NodePosY);
-		NodeJson->SetObjectField(TEXT("position"), PositionJson);
-	}
-
-	if (Options.bIncludeAnimNodeProperties)
-	{
-		if (UAnimGraphNode_Base* AnimGraphNode = Cast<UAnimGraphNode_Base>(Node))
+		FString FuncName = MsgNode->FunctionReference.GetMemberName().ToString();
+		NodeJson->SetStringField(TEXT("function_name"), FuncName);
+		if (UClass* InterfaceClass = MsgNode->FunctionReference.GetMemberParentClass())
 		{
-			TSharedPtr<FJsonObject> AnimPropsJson = ExtractAnimNodeProperties(AnimGraphNode);
-			if (AnimPropsJson.IsValid())
+			NodeJson->SetStringField(TEXT("function_class"), InterfaceClass->GetName());
+			NodeJson->SetStringField(TEXT("function_class_path"), InterfaceClass->GetPathName());
+		}
+	}
+	else if (UK2Node_CallFunction* CallFuncNode = Cast<UK2Node_CallFunction>(Node))
+	{
+		NodeJson->SetStringField(TEXT("function_name"), CallFuncNode->FunctionReference.GetMemberName().ToString());
+		if (UClass* ParentCls = CallFuncNode->FunctionReference.GetMemberParentClass())
+		{
+			NodeJson->SetStringField(TEXT("function_class"), ParentCls->GetName());
+			NodeJson->SetStringField(TEXT("function_class_path"), ParentCls->GetPathName());
+		}
+	}
+	else if (UK2Node_BaseAsyncTask* AsyncTaskNode = Cast<UK2Node_BaseAsyncTask>(Node))
+	{
+		// ProxyFactoryFunctionName is protected — read via reflection
+		if (FNameProperty* FuncNameProp = FindFProperty<FNameProperty>(AsyncTaskNode->GetClass(), TEXT("ProxyFactoryFunctionName")))
+		{
+			FName FuncName = *FuncNameProp->ContainerPtrToValuePtr<FName>(AsyncTaskNode);
+			if (!FuncName.IsNone())
+				NodeJson->SetStringField(TEXT("function_name"), FuncName.ToString());
+		}
+		if (FClassProperty* ClassProp = FindFProperty<FClassProperty>(AsyncTaskNode->GetClass(), TEXT("ProxyFactoryClass")))
+		{
+			UClass* Cls = Cast<UClass>(*ClassProp->ContainerPtrToValuePtr<TObjectPtr<UClass>>(AsyncTaskNode));
+			if (Cls)
 			{
-				NodeJson->SetObjectField(TEXT("anim_node_properties"), AnimPropsJson);
+				NodeJson->SetStringField(TEXT("function_class"), Cls->GetName());
+				// ExportText format — compatible with ImportText on the create side
+				FString ClassRef;
+				ClassProp->ExportText_Direct(ClassRef, ClassProp->ContainerPtrToValuePtr<void>(AsyncTaskNode), ClassProp->ContainerPtrToValuePtr<void>(AsyncTaskNode), AsyncTaskNode, PPF_None);
+				NodeJson->SetStringField(TEXT("function_class_path"), ClassRef);
 			}
-
-			TSharedPtr<FJsonObject> AnimGraphNodeJson = ExtractAnimGraphNodeMetadata(AnimGraphNode);
-			if (AnimGraphNodeJson.IsValid())
+		}
+		// ProxyClass (on K2Node_LatentAbilityCall, separate from ProxyFactoryClass)
+		{
+			if (FClassProperty* ProxyClsProp = FindFProperty<FClassProperty>(AsyncTaskNode->GetClass(), TEXT("ProxyClass")))
 			{
-				NodeJson->SetObjectField(TEXT("anim_graph_node"), AnimGraphNodeJson);
+				FString ProxyClassRef;
+				ProxyClsProp->ExportText_Direct(ProxyClassRef, ProxyClsProp->ContainerPtrToValuePtr<void>(AsyncTaskNode), ProxyClsProp->ContainerPtrToValuePtr<void>(AsyncTaskNode), AsyncTaskNode, PPF_None);
+				NodeJson->SetStringField(TEXT("proxy_class_path"), ProxyClassRef);
 			}
 		}
 	}
+	// PromotableOperator: extra properties beyond FunctionReference (all private)
+	if (UK2Node_PromotableOperator* PromoNode = Cast<UK2Node_PromotableOperator>(Node))
+	{
+		if (FNameProperty* OpProp = FindFProperty<FNameProperty>(PromoNode->GetClass(), TEXT("OperationName")))
+		{
+			FName OpName = *OpProp->ContainerPtrToValuePtr<FName>(PromoNode);
+			if (!OpName.IsNone())
+				NodeJson->SetStringField(TEXT("operation_name"), OpName.ToString());
+		}
+		if (FIntProperty* NAIProp = FindFProperty<FIntProperty>(PromoNode->GetClass(), TEXT("NumAdditionalInputs")))
+		{
+			int32 NAI = *NAIProp->ContainerPtrToValuePtr<int32>(PromoNode);
+			if (NAI > 0)
+				NodeJson->SetNumberField(TEXT("num_additional_inputs"), NAI);
+		}
+	}
 
+	if (UK2Node_ComponentBoundEvent* CompEvt = Cast<UK2Node_ComponentBoundEvent>(Node))
+	{
+		NodeJson->SetStringField(TEXT("event_name"), CompEvt->EventReference.GetMemberName().ToString());
+		if (!CompEvt->ComponentPropertyName.IsNone())
+			NodeJson->SetStringField(TEXT("component_name"), CompEvt->ComponentPropertyName.ToString());
+		if (!CompEvt->DelegatePropertyName.IsNone())
+			NodeJson->SetStringField(TEXT("delegate_name"), CompEvt->DelegatePropertyName.ToString());
+		if (CompEvt->DelegateOwnerClass)
+			NodeJson->SetStringField(TEXT("delegate_owner_class"), CompEvt->DelegateOwnerClass->GetPathName());
+	}
+
+	else if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+	{
+		NodeJson->SetStringField(TEXT("event_name"), EventNode->EventReference.GetMemberName().ToString());
+	}
+	else if (UK2Node_DynamicCast* CastNode = Cast<UK2Node_DynamicCast>(Node))
+	{
+		if (CastNode->TargetType)
+		{
+			NodeJson->SetStringField(TEXT("cast_to"), CastNode->TargetType->GetPathName());
+		}
+	}
+	else if (UK2Node_VariableGet* VarGetNode = Cast<UK2Node_VariableGet>(Node))
+	{
+		NodeJson->SetStringField(TEXT("variable_name"), VarGetNode->VariableReference.GetMemberName().ToString());
+		if (VarGetNode->VariableReference.GetMemberParentClass())
+		{
+			NodeJson->SetStringField(TEXT("variable_parent_class"), VarGetNode->VariableReference.GetMemberParentClass()->GetPathName());
+		}
+	}
+	else if (UK2Node_VariableSet* VarSetNode = Cast<UK2Node_VariableSet>(Node))
+	{
+		NodeJson->SetStringField(TEXT("variable_name"), VarSetNode->VariableReference.GetMemberName().ToString());
+		if (VarSetNode->VariableReference.GetMemberParentClass())
+		{
+			NodeJson->SetStringField(TEXT("variable_parent_class"), VarSetNode->VariableReference.GetMemberParentClass()->GetPathName());
+		}
+	}
+	else if (UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(Node))
+	{
+		// Read MacroGraphReference (protected) to capture macro identity
+		if (FStructProperty* RefProp = FindFProperty<FStructProperty>(MacroNode->GetClass(), TEXT("MacroGraphReference")))
+		{
+			void* RefPtr = RefProp->ContainerPtrToValuePtr<void>(MacroNode);
+			if (FObjectProperty* BPProp = FindFProperty<FObjectProperty>(RefProp->Struct, TEXT("GraphBlueprint")))
+			{
+				UObject* BP = BPProp->GetObjectPropertyValue(BPProp->ContainerPtrToValuePtr<void>(RefPtr));
+				if (BP)
+					NodeJson->SetStringField(TEXT("macro_blueprint"), BP->GetPathName());
+			}
+			if (FObjectProperty* GraphProp = FindFProperty<FObjectProperty>(RefProp->Struct, TEXT("MacroGraph")))
+			{
+				UObject* Graph = GraphProp->GetObjectPropertyValue(GraphProp->ContainerPtrToValuePtr<void>(RefPtr));
+				if (Graph)
+					NodeJson->SetStringField(TEXT("macro_graph"), Graph->GetName());
+			}
+		}
+	}
+	else if (UK2Node_MakeArray* MakeArrayNode = Cast<UK2Node_MakeArray>(Node))
+	{
+		NodeJson->SetNumberField(TEXT("num_inputs"), MakeArrayNode->NumInputs);
+	}
+	else if (UK2Node_Timeline* TimelineNode = Cast<UK2Node_Timeline>(Node))
+	{
+		if (!TimelineNode->TimelineName.IsNone())
+			NodeJson->SetStringField(TEXT("timeline_name"), TimelineNode->TimelineName.ToString());
+	}
+	else if (UK2Node_BreakStruct* BreakNode = Cast<UK2Node_BreakStruct>(Node))
+	{
+		if (BreakNode->StructType)
+			NodeJson->SetStringField(TEXT("struct_type"), BreakNode->StructType->GetPathName());
+	}
 	// Pins
 	TArray<TSharedPtr<FJsonValue>> PinsArray;
 	for (UEdGraphPin* Pin : Node->Pins)
 	{
-		if (!Pin) continue;
-
 		TSharedPtr<FJsonObject> PinJson = PinToJson(Pin);
 		if (PinJson.IsValid())
 		{
@@ -515,6 +635,12 @@ TSharedPtr<FJsonObject> UQueryBlueprintGraphTool::NodeToJson(UEdGraphNode* Node,
 		}
 	}
 	NodeJson->SetArrayField(TEXT("pins"), PinsArray);
+
+	// Position
+	TSharedPtr<FJsonObject> PosJson = MakeShareable(new FJsonObject);
+	PosJson->SetNumberField(TEXT("x"), Node->NodePosX);
+	PosJson->SetNumberField(TEXT("y"), Node->NodePosY);
+	NodeJson->SetObjectField(TEXT("position"), PosJson);
 
 	return NodeJson;
 }
@@ -553,7 +679,7 @@ TSharedPtr<FJsonObject> UQueryBlueprintGraphTool::PinToJson(UEdGraphPin* Pin) co
 		if (!LinkedNode) continue;
 
 		TSharedPtr<FJsonObject> ConnectionJson = MakeShareable(new FJsonObject);
-		ConnectionJson->SetStringField(TEXT("node_guid"), LinkedNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		ConnectionJson->SetStringField(TEXT("node_guid"), LinkedNode->GetName());
 		ConnectionJson->SetStringField(TEXT("pin_name"), LinkedPin->PinName.ToString());
 		ConnectionsArray.Add(MakeShareable(new FJsonValueObject(ConnectionJson)));
 	}

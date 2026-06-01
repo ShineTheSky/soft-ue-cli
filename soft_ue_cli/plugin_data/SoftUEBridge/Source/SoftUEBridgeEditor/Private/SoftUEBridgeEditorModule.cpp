@@ -12,6 +12,7 @@
 // Asset
 #include "Tools/Asset/QueryAssetTool.h"
 #include "Tools/Asset/QueryEnumTool.h"
+#include "Tools/Asset/ModifyEnumTool.h"
 #include "Tools/Asset/QueryStructTool.h"
 #include "Tools/Asset/DeleteAssetTool.h"
 #include "Tools/Asset/EditCustomizableObjectGraphTool.h"
@@ -26,6 +27,10 @@
 // Blueprint
 #include "Tools/Blueprint/QueryBlueprintTool.h"
 #include "Tools/Blueprint/QueryBlueprintGraphTool.h"
+
+// BehaviorTree
+#include "Tools/BehaviorTree/QueryBehaviorTreeTool.h"
+#include "Tools/BehaviorTree/CreateBehaviorTreeFromJsonTool.h"
 
 // Build
 #include "Tools/Build/BuildAndRelaunchTool.h"
@@ -98,6 +103,7 @@
 #include "Tools/Write/DisconnectGraphPinTool.h"
 #include "Tools/Write/SetNodePositionTool.h"
 #include "Tools/Write/CreateAssetTool.h"
+#include "Tools/Blueprint/CreateBlueprintFromJsonTool.h"
 #include "Tools/Write/ModifyInterfaceTool.h"
 #include "Tools/Write/SaveAssetTool.h"
 #include "Tools/Write/CompileBlueprintTool.h"
@@ -171,6 +177,10 @@ void FSoftUEBridgeEditorModule::StartupModule()
 	// Blueprint
 	Registry.RegisterToolClass<UQueryBlueprintTool>();
 	Registry.RegisterToolClass<UQueryBlueprintGraphTool>();
+
+	// BehaviorTree
+	Registry.RegisterToolClass<UQueryBehaviorTreeTool>();
+	Registry.RegisterToolClass<UCreateBehaviorTreeFromJsonTool>();
 
 	// Build
 	Registry.RegisterToolClass<UBuildAndRelaunchTool>();
@@ -246,6 +256,8 @@ void FSoftUEBridgeEditorModule::StartupModule()
 	Registry.RegisterToolClass<UDisconnectGraphPinTool>();
 	Registry.RegisterToolClass<USetNodePositionTool>();
 	Registry.RegisterToolClass<UCreateAssetTool>();
+	Registry.RegisterToolClass<UModifyEnumTool>();
+	Registry.RegisterToolClass<UCreateBlueprintFromJsonTool>();
 	Registry.RegisterToolClass<UModifyInterfaceTool>();
 	Registry.RegisterToolClass<USaveAssetTool>();
 	Registry.RegisterToolClass<UCompileBlueprintTool>();
