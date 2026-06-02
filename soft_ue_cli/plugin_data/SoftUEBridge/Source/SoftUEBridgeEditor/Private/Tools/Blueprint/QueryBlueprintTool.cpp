@@ -1,6 +1,5 @@
 // Copyright softdaddy-o 2024. All Rights Reserved.
 // Copyright ShineTheSky 2026. All Rights Reserved.
-
 #include "Tools/Blueprint/QueryBlueprintTool.h"
 #include "SoftUEBridgeEditorModule.h"
 #include "Engine/Blueprint.h"
@@ -8,6 +7,8 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/InheritableComponentHandler.h"
+#include "Engine/TimelineTemplate.h"
+#include "Components/TimelineComponent.h"
 #include "EdGraph/EdGraph.h"
 #include "K2Node.h"
 #include "K2Node_Event.h"
@@ -187,6 +188,11 @@ FBridgeToolResult UQueryBlueprintTool::Execute(
 	if (bAll || Include == TEXT("components"))
 	{
 		Result->SetObjectField(TEXT("components"), ExtractComponents(Blueprint, bDetailed, SearchFilter));
+	}
+
+	if (bAll || Include == TEXT("timelines"))
+	{
+		Result->SetObjectField(TEXT("timelines"), ExtractTimelines(Blueprint));
 	}
 
 	if (bAll || Include == TEXT("graph"))
@@ -893,6 +899,74 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractInterfaces(UBlueprint* Bluep
 	Result->SetArrayField(TEXT("interfaces"), InterfaceArray);
 	Result->SetNumberField(TEXT("count"), InterfaceArray.Num());
 
+	return Result;
+}
+
+TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractTimelines(UBlueprint* Blueprint) const
+{
+	TSharedPtr<FJsonObject> Result = MakeShareable(new FJsonObject);
+	TArray<TSharedPtr<FJsonValue>> TimelineArray;
+
+	for (UTimelineTemplate* Template : Blueprint->Timelines)
+	{
+		if (!Template) continue;
+
+		TSharedPtr<FJsonObject> TlObj = MakeShareable(new FJsonObject);
+		TlObj->SetStringField(TEXT("timeline_name"), Template->GetVariableName().ToString());
+		TlObj->SetNumberField(TEXT("timeline_length"), Template->TimelineLength);
+		TlObj->SetNumberField(TEXT("length_mode"), static_cast<int32>(Template->LengthMode.GetValue()));
+		TlObj->SetBoolField(TEXT("b_auto_play"), Template->bAutoPlay);
+		TlObj->SetBoolField(TEXT("b_loop"), Template->bLoop);
+		TlObj->SetBoolField(TEXT("b_replicated"), Template->bReplicated);
+		TlObj->SetBoolField(TEXT("b_ignore_time_dilation"), Template->bIgnoreTimeDilation);
+		TlObj->SetStringField(TEXT("guid"), Template->TimelineGuid.ToString());
+
+		// Tracks
+		TArray<TSharedPtr<FJsonValue>> TrackArray;
+
+		for (const FTTEventTrack& Track : Template->EventTracks)
+		{
+			TSharedPtr<FJsonObject> T = MakeShareable(new FJsonObject);
+			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
+			T->SetStringField(TEXT("type"), TEXT("event"));
+			T->SetStringField(TEXT("function_name"), Track.GetFunctionName().ToString());
+			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
+		}
+
+		for (const FTTFloatTrack& Track : Template->FloatTracks)
+		{
+			TSharedPtr<FJsonObject> T = MakeShareable(new FJsonObject);
+			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
+			T->SetStringField(TEXT("type"), TEXT("float"));
+			T->SetStringField(TEXT("property_name"), Track.GetPropertyName().ToString());
+			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
+		}
+
+		for (const FTTVectorTrack& Track : Template->VectorTracks)
+		{
+			TSharedPtr<FJsonObject> T = MakeShareable(new FJsonObject);
+			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
+			T->SetStringField(TEXT("type"), TEXT("vector"));
+			T->SetStringField(TEXT("property_name"), Track.GetPropertyName().ToString());
+			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
+		}
+
+		for (const FTTLinearColorTrack& Track : Template->LinearColorTracks)
+		{
+			TSharedPtr<FJsonObject> T = MakeShareable(new FJsonObject);
+			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
+			T->SetStringField(TEXT("type"), TEXT("linear_color"));
+			T->SetStringField(TEXT("property_name"), Track.GetPropertyName().ToString());
+			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
+		}
+
+		TlObj->SetArrayField(TEXT("tracks"), TrackArray);
+		TlObj->SetNumberField(TEXT("track_count"), TrackArray.Num());
+		TimelineArray.Add(MakeShareable(new FJsonValueObject(TlObj)));
+	}
+
+	Result->SetArrayField(TEXT("items"), TimelineArray);
+	Result->SetNumberField(TEXT("count"), TimelineArray.Num());
 	return Result;
 }
 

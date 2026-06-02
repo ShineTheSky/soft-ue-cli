@@ -30,6 +30,10 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/TimelineTemplate.h"
+#include "Curves/CurveFloat.h"
+#include "Curves/CurveVector.h"
+#include "Curves/CurveLinearColor.h"
+#include "Curves/RealCurve.h"
 // K2Node_ForEachLoop removed in UE 5.7
 #include "K2Node_Self.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -399,6 +403,165 @@ FBridgeToolResult UCreateBlueprintFromJsonTool::Execute(
 		// ── Create nodes ────────────────────────────────────────────────────
 TArray<FString> NodeErrors;
 
+		// Create Timeline templates (before nodes so AllocateDefaultPins finds them)
+	const TArray<TSharedPtr<FJsonValue>>* TimelinesArray = nullptr;
+	if (Args->TryGetArrayField(TEXT("timelines"), TimelinesArray))
+	{
+		for (const TSharedPtr<FJsonValue>& TlVal : *TimelinesArray)
+		{
+			const TSharedPtr<FJsonObject>* TlObj = nullptr;
+			if (!TlVal->TryGetObject(TlObj)) continue;
+
+			FString TlName;
+			(*TlObj)->TryGetStringField(TEXT("timeline_name"), TlName);
+			if (TlName.IsEmpty()) continue;
+
+			// Use the engine's proper timeline creation
+			UTimelineTemplate* Template = FBlueprintEditorUtils::AddNewTimeline(Blueprint, FName(*TlName));
+			if (!Template) continue;
+
+			double Length;
+			if ((*TlObj)->TryGetNumberField(TEXT("timeline_length"), Length))
+				Template->TimelineLength = static_cast<float>(Length);
+
+			bool bVal;
+			if ((*TlObj)->TryGetBoolField(TEXT("b_auto_play"), bVal)) Template->bAutoPlay = bVal;
+			if ((*TlObj)->TryGetBoolField(TEXT("b_loop"), bVal)) Template->bLoop = bVal;
+			if ((*TlObj)->TryGetBoolField(TEXT("b_replicated"), bVal)) Template->bReplicated = bVal;
+			if ((*TlObj)->TryGetBoolField(TEXT("b_ignore_time_dilation"), bVal)) Template->bIgnoreTimeDilation = bVal;
+
+			const TArray<TSharedPtr<FJsonValue>>* TracksArray = nullptr;
+			if ((*TlObj)->TryGetArrayField(TEXT("tracks"), TracksArray))
+			{
+				for (const TSharedPtr<FJsonValue>& TrVal : *TracksArray)
+				{
+					const TSharedPtr<FJsonObject>* TrObj = nullptr;
+					if (!TrVal->TryGetObject(TrObj)) continue;
+
+					FString TrName, TrType;
+					(*TrObj)->TryGetStringField(TEXT("name"), TrName);
+					(*TrObj)->TryGetStringField(TEXT("type"), TrType);
+
+					if (TrType == TEXT("event"))
+					{
+						FTTEventTrack Track;
+						Track.SetTrackName(FName(*TrName), Template);
+						Track.CurveKeys = NewObject<UCurveFloat>(Blueprint, NAME_None, RF_Transactional);
+						Template->EventTracks.Add(Track);
+						Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_Event, Template->EventTracks.Num() - 1));
+					}
+					else if (TrType == TEXT("float"))
+					{
+						FTTFloatTrack Track;
+						Track.SetTrackName(FName(*TrName), Template);
+						Track.CurveFloat = NewObject<UCurveFloat>(Blueprint, NAME_None, RF_Transactional);
+						Template->FloatTracks.Add(Track);
+						Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_FloatInterp, Template->FloatTracks.Num() - 1));
+					}
+					else if (TrType == TEXT("vector"))
+					{
+						FTTVectorTrack Track;
+						Track.SetTrackName(FName(*TrName), Template);
+						Track.CurveVector = NewObject<UCurveVector>(Blueprint, NAME_None, RF_Transactional);
+						Template->VectorTracks.Add(Track);
+						Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_VectorInterp, Template->VectorTracks.Num() - 1));
+					}
+					else if (TrType == TEXT("linear_color"))
+					{
+						FTTLinearColorTrack Track;
+						Track.SetTrackName(FName(*TrName), Template);
+						Track.CurveLinearColor = NewObject<UCurveLinearColor>(Blueprint, NAME_None, RF_Transactional);
+						Template->LinearColorTracks.Add(Track);
+						Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_LinearColorInterp, Template->LinearColorTracks.Num() - 1));
+					}
+					// Restore curve keys and settings
+				{
+					auto RestoreRichCurve = [](FRichCurve& Curve, const TSharedPtr<FJsonObject>& TrObj) {
+						const TSharedPtr<FJsonObject>* S = nullptr;
+						if (TrObj->TryGetObjectField(TEXT("curve_settings"), S))
+						{
+							int32 IV; double DV;
+							if ((*S)->TryGetNumberField(TEXT("pre_infinity_extrap"), IV))
+								Curve.PreInfinityExtrap = static_cast<ERichCurveExtrapolation>(IV);
+							if ((*S)->TryGetNumberField(TEXT("post_infinity_extrap"), IV))
+								Curve.PostInfinityExtrap = static_cast<ERichCurveExtrapolation>(IV);
+							if ((*S)->TryGetNumberField(TEXT("default_value"), DV))
+								Curve.SetDefaultValue(static_cast<float>(DV));
+						}
+						const TArray<TSharedPtr<FJsonValue>>* Keys = nullptr;
+						if (TrObj->TryGetArrayField(TEXT("curve_keys"), Keys))
+						{
+							// Build a sorted array of FRichCurveKey and use SetKeys to avoid AutoSetTangents
+							TArray<FRichCurveKey> NewKeys;
+							for (const TSharedPtr<FJsonValue>& Kv : *Keys)
+							{
+								const TSharedPtr<FJsonObject>* K = nullptr;
+								if (!Kv->TryGetObject(K)) continue;
+								double T, V;
+								if (!(*K)->TryGetNumberField(TEXT("time"), T)) continue;
+								if (!(*K)->TryGetNumberField(TEXT("value"), V)) continue;
+								FRichCurveKey NewKey(static_cast<float>(T), static_cast<float>(V));
+								double DV;
+								// Read all numeric fields as double, then cast to int for enums
+								if ((*K)->TryGetNumberField(TEXT("interp_mode"), DV))
+									NewKey.InterpMode = static_cast<ERichCurveInterpMode>(static_cast<int32>(DV));
+								if ((*K)->TryGetNumberField(TEXT("tangent_mode"), DV))
+									NewKey.TangentMode = static_cast<ERichCurveTangentMode>(static_cast<int32>(DV));
+								if ((*K)->TryGetNumberField(TEXT("tangent_weight_mode"), DV))
+									NewKey.TangentWeightMode = static_cast<ERichCurveTangentWeightMode>(static_cast<int32>(DV));
+								if ((*K)->TryGetNumberField(TEXT("arrive_tangent"), DV))
+									NewKey.ArriveTangent = static_cast<float>(DV);
+								if ((*K)->TryGetNumberField(TEXT("leave_tangent"), DV))
+									NewKey.LeaveTangent = static_cast<float>(DV);
+								if ((*K)->TryGetNumberField(TEXT("arrive_tangent_weight"), DV))
+									NewKey.ArriveTangentWeight = static_cast<float>(DV);
+								if ((*K)->TryGetNumberField(TEXT("leave_tangent_weight"), DV))
+									NewKey.LeaveTangentWeight = static_cast<float>(DV);
+								NewKeys.Add(NewKey);
+							}
+							Curve.SetKeys(NewKeys);
+							// SetKeys calls AutoSetTangents, re-apply original tangent values
+							for (int32 Idx = 0; Idx < FMath::Min(NewKeys.Num(), Curve.Keys.Num()); ++Idx)
+							{
+								Curve.Keys[Idx].ArriveTangent = NewKeys[Idx].ArriveTangent;
+								Curve.Keys[Idx].LeaveTangent = NewKeys[Idx].LeaveTangent;
+								Curve.Keys[Idx].ArriveTangentWeight = NewKeys[Idx].ArriveTangentWeight;
+								Curve.Keys[Idx].LeaveTangentWeight = NewKeys[Idx].LeaveTangentWeight;
+							}
+						}
+					};
+
+					int32 EvtIdx = 0, FltIdx = 0;
+					for (const TSharedPtr<FJsonValue>& TrVal : *TracksArray)
+					{
+						const TSharedPtr<FJsonObject>* TrObj = nullptr;
+						if (!TrVal->TryGetObject(TrObj)) continue;
+						FString TrType;
+						(*TrObj)->TryGetStringField(TEXT("type"), TrType);
+
+						if (TrType == TEXT("event") && EvtIdx < Template->EventTracks.Num())
+						{
+							if (Template->EventTracks[EvtIdx].CurveKeys)
+								RestoreRichCurve(Template->EventTracks[EvtIdx].CurveKeys->FloatCurve, *TrObj);
+							EvtIdx++;
+						}
+						else if (TrType == TEXT("float") && FltIdx < Template->FloatTracks.Num())
+						{
+							if (Template->FloatTracks[FltIdx].CurveFloat)
+								RestoreRichCurve(Template->FloatTracks[FltIdx].CurveFloat->FloatCurve, *TrObj);
+							FltIdx++;
+						}
+					}
+				}
+			}
+		}
+	}
+
+				}
+			}
+		}
+	}
+
 	for (const TSharedPtr<FJsonValue>& NodeVal : *NodesArray)
 	{
 		const TSharedPtr<FJsonObject>* NodeObjPtr = nullptr;
@@ -490,6 +653,32 @@ TArray<FString> NodeErrors;
 			}
 		}
 	}
+
+// Apply pin default objects (class/object pins)
+			const TSharedPtr<FJsonObject>* DefaultObjsObj = nullptr;
+			if (NodeObj->TryGetObjectField(TEXT("default_objects"), DefaultObjsObj))
+			{
+				const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(Schema);
+				if (K2Schema)
+				{
+					for (const auto& Pair : (*DefaultObjsObj)->Values)
+					{
+						UEdGraphPin* Pin2 = FindPin(Node, Pair.Key);
+						if (Pin2)
+						{
+							FString ObjPath = Pair.Value->AsString();
+							if (!ObjPath.IsEmpty())
+							{
+								K2Schema->SetPinDefaultValueAtConstruction(Pin2, ObjPath);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+
 
 	// ── Create connections ──────────────────────────────────────────────
 	if (ConnectionsArray)

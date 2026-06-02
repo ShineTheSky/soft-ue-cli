@@ -8,3 +8,4 @@ dist/
 .coverage
 *.so
 *.dylib
+PROJECT_ANALYSIS.md

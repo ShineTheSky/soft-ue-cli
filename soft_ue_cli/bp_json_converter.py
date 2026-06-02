@@ -236,21 +236,25 @@ def convert_to_create_json(
 
                 # ── Pin defaults + types ──
                 pin_defaults: dict[str, str] = {}
+                pin_default_objects: dict[str, str] = {}
                 pin_types: dict[str, str] = {}
                 for pin in node.get("pins", []):
                     pin_name = pin.get("name", "")
                     dv = pin.get("default_value", "")
                     if dv and dv not in ("None", "0.0", "0", "false", ""):
                         pin_defaults[pin_name] = dv
-                        # Save pin type so create side can fix up AllocateDefaultPins output
-                        cat = pin.get("category", "")
-                        sub = pin.get("sub_category_object", "")
-                        if sub:
-                            pin_types[pin_name] = f"{cat}/{sub}"
-                        elif cat == "real":
-                            pin_types[pin_name] = "real/float"
-                        elif cat and cat not in ("exec", "bool", "int", "byte", "name", "string", "text"):
-                            pin_types[pin_name] = cat
+                    dob = pin.get("default_object", "")
+                    if dob:
+                        pin_default_objects[pin_name] = dob
+                    # Save pin type so create side can fix up AllocateDefaultPins output
+                    cat = pin.get("category", "")
+                    sub = pin.get("sub_category_object", "")
+                    if sub:
+                        pin_types[pin_name] = f"{cat}/{sub}"
+                    elif cat == "real":
+                        pin_types[pin_name] = "real/float"
+                    elif cat and cat not in ("exec",):
+                        pin_types[pin_name] = cat
 
                     # ── Connections ──
                     for conn in pin.get("connections", []):
@@ -266,6 +270,8 @@ def convert_to_create_json(
 
                 if pin_defaults:
                     node_def["defaults"] = pin_defaults
+                if pin_default_objects:
+                    node_def["default_objects"] = pin_default_objects
                 if pin_types:
                     node_def["pin_types"] = pin_types
 

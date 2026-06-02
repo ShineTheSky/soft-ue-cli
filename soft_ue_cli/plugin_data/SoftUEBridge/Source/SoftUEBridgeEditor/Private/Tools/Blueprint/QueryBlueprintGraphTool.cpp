@@ -709,6 +709,9 @@ TSharedPtr<FJsonObject> UQueryBlueprintGraphTool::PinToJson(UEdGraphPin* Pin) co
 	{
 		PinJson->SetStringField(TEXT("default_value"), Pin->DefaultValue);
 	}
+if (Pin->DefaultObject)
+	{
+		PinJson->SetStringField(TEXT("default_object"), Pin->DefaultObject->GetPathName());
 
 	// Connections
 	TArray<TSharedPtr<FJsonValue>> ConnectionsArray;
