@@ -96,7 +96,8 @@ This fork extends soft-ue-cli with authoring, introspection, and serialization t
 - **Enhanced QueryBlueprintTool** — component introspection and function override discovery.
 - **Python tools:**
   - `blueprint_json.py` — validate Blueprint JSON structure and route to bridge for creation.
-  - `bp_json_converter.py` — convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create).
+  - `bp_json_converter.py` — convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create); supports event_graph, function_graphs, and macro_graphs.
+  - `bp_yaml_converter.py` — YAML anchor/alias pipeline for readable, diff-friendly Blueprint graph representation (round-trip: YAML ↔ JSON → Bridge).
   - `bt_dsl_compiler.py` — compile indented-text DSL (.bttxt) to/from Behavior Tree JSON.
   - `bb_json_converter.py` — BlackboardData JSON round-trip (parse/export blackboard key definitions).
 

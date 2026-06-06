@@ -6,16 +6,24 @@ All notable changes to soft-ue-cli will be documented in this file.
 
 ### Added
 - **ModifyEnumTool** -- add, remove, or rename enumerators in UserDefinedEnum assets.
-- **CreateBlueprintFromJsonTool** -- create Blueprints from JSON, building both the EventGraph (Events, CallFunction, Variable Get/Set, Branch, Sequence, DynamicCast, Timeline, BreakStruct, etc.) and the SCS component tree with component property initialization.
+- **CreateBlueprintFromJsonTool** -- create Blueprints from JSON, building the EventGraph, function graphs, macro graphs (Events, CallFunction, Variable Get/Set, Branch, Sequence, DynamicCast, Timeline, BreakStruct, etc.) and the SCS component tree with component property initialization.
 - **CreateBehaviorTreeFromJsonTool** -- create Behavior Trees from JSON; paired with `bt_dsl_compiler` which compiles .bttxt indented-text DSL into BT JSON.
 - **QueryBehaviorTreeTool** -- query Behavior Tree assets: blackboard keys, composite tree structure, decorators, services, and per-node UPROPERTY values.
-- **QueryBlueprintGraphTool** -- enhanced with full K2Node query support (Event, CustomEvent, CallFunction, FunctionEntry/Result, Variable Get/Set, DynamicCast, Branch, Sequence, MacroInstance, Timeline, BreakStruct, MakeArray, Tunnel, ComponentBoundEvent, PromotableOperator, BaseAsyncTask, Message) plus Animation Blueprint graph support.
+- **QueryBlueprintGraphTool** -- enhanced with full K2Node query support (Event, CustomEvent, CallFunction, FunctionEntry/Result, Variable Get/Set, DynamicCast, Branch, Sequence, MacroInstance, Timeline, BreakStruct, MakeArray, Tunnel, ComponentBoundEvent, PromotableOperator, BaseAsyncTask, Message) plus Animation Blueprint and function/macro graph support.
 - **QueryBlueprintTool** -- enhanced with component introspection and function override discovery.
+- **Blueprint YAML pipeline** -- `blueprint-to-yaml` and `blueprint-from-yaml` commands using ruamel.yaml anchors for readable, diff-friendly graph representation.
 - **Python tools:**
   - `blueprint_json.py` -- validate Blueprint JSON structure and route to bridge for creation.
-  - `bp_json_converter.py` -- convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create).
+  - `bp_json_converter.py` -- convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create); supports event_graph, function_graphs, and macro_graphs.
+  - `bp_yaml_converter.py` -- YAML anchor/alias pipeline for readable, diff-friendly Blueprint graph round-trip.
   - `bt_dsl_compiler.py` -- compile indented-text DSL (.bttxt) to/from Behavior Tree JSON.
   - `bb_json_converter.py` -- BlackboardData JSON round-trip (parse/export blackboard key definitions).
+
+### Fixed
+- **BeginPlay and inherited events not overriding** -- event nodes now correctly set `bOverrideFunction` and look up parent class functions.
+- **Instanced subobject arrays** -- SCS component templates and CDO defaults now use `StaticDuplicateObject` for instanced subobject arrays instead of raw import.
+- **Behavior tree blackboard overwritten** -- blackboard is loaded early (error if missing), and `BlackboardAsset` + `UpdateBlackboardChange` is set on the root node.
+- **Blueprint graph creation code deduplicated** -- event, function, and macro graph building now share common logic.
 
 ## [1.34.0] - 2026-05-25
 
