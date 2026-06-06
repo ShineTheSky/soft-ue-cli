@@ -15,6 +15,9 @@
 #include "K2Node.h"
 #include "K2Node_Event.h"
 #include "K2Node_CustomEvent.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
+#include "K2Node_EditablePinBase.h"
 #include "K2Node_CallFunction.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
@@ -34,6 +37,7 @@
 #include "Curves/CurveVector.h"
 #include "Curves/CurveLinearColor.h"
 #include "Curves/RealCurve.h"
+#include "Misc/PackageName.h"
 // K2Node_ForEachLoop removed in UE 5.7
 #include "K2Node_Self.h"
 #include "Kismet2/BlueprintEditorUtils.h"
@@ -42,6 +46,12 @@
 #include "UObject/SavePackage.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "GameFramework/Actor.h"
+#include "UObject/UnrealType.h"
+#include "GameplayEffect.h"
+#include "GameplayEffectComponents/TargetTagsGameplayEffectComponent.h"
+#include "GameplayEffectComponents/AssetTagsGameplayEffectComponent.h"
+#include "GameplayEffectComponents/BlockAbilityTagsGameplayEffectComponent.h"
+#include "GameplayEffectComponents/TargetTagRequirementsGameplayEffectComponent.h"
 
 // ── Aliases from the Python validator ───────────────────────────────────────
 static const TMap<FString, FString> NodeTypeAliases = {
@@ -65,6 +75,72 @@ static const TMap<FString, FString> NodeTypeAliases = {
 	{ TEXT("ExecutionSequence"),  TEXT("K2Node_ExecutionSequence") },
 };
 
+static void SplitTopLevelArrayElements(const FString& InText, TArray<FString>& OutElements)
+{
+	OutElements.Reset();
+
+	FString Current;
+	int32 ParenDepth = 0;
+	bool bInSingleQuote = false;
+	bool bInDoubleQuote = false;
+
+	for (int32 Index = 0; Index < InText.Len(); ++Index)
+	{
+		const TCHAR Ch = InText[Index];
+		if (Ch == TEXT('\'') && !bInDoubleQuote)
+		{
+			bInSingleQuote = !bInSingleQuote;
+		}
+		else if (Ch == TEXT('"') && !bInSingleQuote)
+		{
+			bInDoubleQuote = !bInDoubleQuote;
+		}
+		else if (!bInSingleQuote && !bInDoubleQuote)
+		{
+			if (Ch == TEXT('('))
+			{
+				++ParenDepth;
+			}
+			else if (Ch == TEXT(')') && ParenDepth > 0)
+			{
+				--ParenDepth;
+			}
+			else if (Ch == TEXT(',') && ParenDepth == 0)
+			{
+				OutElements.Add(Current.TrimStartAndEnd());
+				Current.Reset();
+				continue;
+			}
+		}
+
+		Current.AppendChar(Ch);
+	}
+
+	if (!Current.TrimStartAndEnd().IsEmpty())
+	{
+		OutElements.Add(Current.TrimStartAndEnd());
+	}
+}
+
+static bool ParseObjectExportText(const FString& InText, FString& OutClassPath, FString& OutObjectPath)
+{
+	FString Text = InText.TrimStartAndEnd().TrimQuotes();
+	int32 QuoteStart = INDEX_NONE;
+	int32 QuoteEnd = INDEX_NONE;
+	if (!Text.FindChar(TEXT('\''), QuoteStart) || QuoteStart <= 0)
+	{
+		return false;
+	}
+	if (!Text.FindLastChar(TEXT('\''), QuoteEnd) || QuoteEnd <= QuoteStart)
+	{
+		return false;
+	}
+
+	OutClassPath = Text.Left(QuoteStart);
+	OutObjectPath = Text.Mid(QuoteStart + 1, QuoteEnd - QuoteStart - 1);
+	return !OutClassPath.IsEmpty();
+}
+
 FString UCreateBlueprintFromJsonTool::ResolveNodeType(const FString& TypeName)
 {
 	if (const FString* Alias = NodeTypeAliases.Find(TypeName))
@@ -75,6 +151,262 @@ FString UCreateBlueprintFromJsonTool::ResolveNodeType(const FString& TypeName)
 }
 
 // ── Tool metadata ───────────────────────────────────────────────────────────
+
+void UCreateBlueprintFromJsonTool::ApplyPromotablePinTypes(
+	UEdGraphNode* Node,
+	const TSharedPtr<FJsonObject>& NodeJson)
+{
+	if (!Cast<UK2Node_PromotableOperator>(Node))
+	{
+		return;
+	}
+
+	const TSharedPtr<FJsonObject>* PinTypesObj = nullptr;
+	if (!NodeJson->TryGetObjectField(TEXT("pin_types"), PinTypesObj))
+	{
+		return;
+	}
+
+	for (const auto& Pair : (*PinTypesObj)->Values)
+	{
+		UEdGraphPin* Pin = FindPin(Node, Pair.Key);
+		if (!Pin)
+		{
+			continue;
+		}
+
+		FString TypeStr = Pair.Value->AsString();
+		FString Cat, Sub;
+		if (TypeStr.Split(TEXT("/"), &Cat, &Sub))
+		{
+			Pin->PinType.PinCategory = FName(*Cat);
+			Pin->PinType.PinSubCategory = Sub.IsEmpty() ? NAME_None : FName(*Sub);
+			Pin->PinType.PinSubCategoryObject = nullptr;
+			if (!Sub.IsEmpty() && Sub != TEXT("float"))
+			{
+				UObject* SubObj = StaticFindObject(UObject::StaticClass(), nullptr, *Sub);
+				if (!SubObj) SubObj = FindFirstObject<UClass>(*Sub, EFindFirstObjectOptions::None);
+				if (!SubObj) SubObj = FindFirstObject<UScriptStruct>(*Sub, EFindFirstObjectOptions::ExactClass);
+				if (SubObj) Pin->PinType.PinSubCategoryObject = SubObj;
+			}
+		}
+		else
+		{
+			Pin->PinType.PinCategory = FName(*TypeStr);
+			Pin->PinType.PinSubCategory = NAME_None;
+			Pin->PinType.PinSubCategoryObject = nullptr;
+		}
+	}
+}
+
+static FEdGraphPinType ParseSerializedPinType(const FString& TypeStr)
+{
+	FEdGraphPinType PinType;
+	FString Cat, Sub;
+	if (TypeStr.Split(TEXT("/"), &Cat, &Sub))
+	{
+		PinType.PinCategory = FName(*Cat);
+		PinType.PinSubCategory = Sub.IsEmpty() ? NAME_None : FName(*Sub);
+		if (!Sub.IsEmpty() && Sub != TEXT("float"))
+		{
+			UObject* SubObj = StaticFindObject(UObject::StaticClass(), nullptr, *Sub);
+			if (!SubObj) SubObj = FindFirstObject<UClass>(*Sub, EFindFirstObjectOptions::None);
+			if (!SubObj) SubObj = FindFirstObject<UScriptStruct>(*Sub, EFindFirstObjectOptions::ExactClass);
+			if (SubObj)
+			{
+				PinType.PinSubCategoryObject = SubObj;
+			}
+		}
+	}
+	else
+	{
+		PinType.PinCategory = FName(*TypeStr);
+		if (TypeStr == TEXT("real"))
+		{
+			PinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+		}
+	}
+	return PinType;
+}
+
+static FString JsonValueToPinDefaultString(const TSharedPtr<FJsonValue>& Value)
+{
+	if (!Value.IsValid())
+	{
+		return FString();
+	}
+	if (Value->Type == EJson::String)
+	{
+		return Value->AsString();
+	}
+	if (Value->Type == EJson::Number)
+	{
+		return FString::Printf(TEXT("%g"), Value->AsNumber());
+	}
+	if (Value->Type == EJson::Boolean)
+	{
+		return Value->AsBool() ? TEXT("true") : TEXT("false");
+	}
+	return Value->AsString();
+}
+
+void UCreateBlueprintFromJsonTool::ApplySerializedPinDefaults(
+	UEdGraphNode* Node,
+	const TSharedPtr<FJsonObject>& NodeJson,
+	const UEdGraphSchema* Schema,
+	bool bCoerceClassPinObjects)
+{
+	const TSharedPtr<FJsonObject>* DefaultsObj = nullptr;
+	if (NodeJson->TryGetObjectField(TEXT("defaults"), DefaultsObj))
+	{
+		for (const auto& Pair : (*DefaultsObj)->Values)
+		{
+			UEdGraphPin* Pin = FindPin(Node, Pair.Key);
+			if (!Pin)
+			{
+				continue;
+			}
+
+			const FString StrVal = JsonValueToPinDefaultString(Pair.Value);
+			if (!StrVal.IsEmpty())
+			{
+				Pin->DefaultValue = StrVal;
+			}
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* DefaultObjsObj = nullptr;
+	if (!NodeJson->TryGetObjectField(TEXT("default_objects"), DefaultObjsObj))
+	{
+		return;
+	}
+
+	const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(Schema);
+	if (!K2Schema)
+	{
+		return;
+	}
+
+	for (const auto& Pair : (*DefaultObjsObj)->Values)
+	{
+		UEdGraphPin* Pin = FindPin(Node, Pair.Key);
+		if (!Pin)
+		{
+			continue;
+		}
+
+		const FString ObjPath = Pair.Value->AsString();
+		if (ObjPath.IsEmpty())
+		{
+			continue;
+		}
+
+		if (bCoerceClassPinObjects && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Class)
+		{
+			UClass* LoadedClass = LoadClass<UObject>(nullptr, *ObjPath);
+			if (!LoadedClass) LoadedClass = FindFirstObject<UClass>(*ObjPath, EFindFirstObjectOptions::None);
+			if (LoadedClass)
+			{
+				Pin->DefaultObject = LoadedClass;
+			}
+		}
+		else
+		{
+			K2Schema->SetPinDefaultValueAtConstruction(Pin, ObjPath);
+		}
+	}
+}
+
+void UCreateBlueprintFromJsonTool::ConnectSerializedPins(
+	const TArray<TSharedPtr<FJsonValue>>* Connections,
+	const TMap<FString, UEdGraphNode*>& IdToNode,
+	const UEdGraphSchema* Schema,
+	TArray<FString>& OutWarnings,
+	bool bWarnOnMalformed)
+{
+	if (!Connections || !Schema)
+	{
+		return;
+	}
+
+	for (const TSharedPtr<FJsonValue>& ConnVal : *Connections)
+	{
+		FString FromStr, ToStr;
+		const TSharedPtr<FJsonObject>* ConnObjPtr = nullptr;
+		if (ConnVal->TryGetObject(ConnObjPtr))
+		{
+			(*ConnObjPtr)->TryGetStringField(TEXT("from"), FromStr);
+			(*ConnObjPtr)->TryGetStringField(TEXT("to"), ToStr);
+		}
+		else
+		{
+			const TArray<TSharedPtr<FJsonValue>>* ConnArr = nullptr;
+			if (ConnVal->TryGetArray(ConnArr) && ConnArr->Num() >= 2)
+			{
+				FromStr = (*ConnArr)[0]->AsString();
+				ToStr = (*ConnArr)[1]->AsString();
+			}
+		}
+
+		if (FromStr.IsEmpty() || ToStr.IsEmpty())
+		{
+			if (bWarnOnMalformed) OutWarnings.Add(TEXT("Skipping malformed connection"));
+			continue;
+		}
+
+		int32 DotPos;
+		if (!FromStr.FindChar('.', DotPos))
+		{
+			if (bWarnOnMalformed) OutWarnings.Add(FString::Printf(TEXT("Invalid connection source: %s"), *FromStr));
+			continue;
+		}
+		const FString FromNodeId = FromStr.Left(DotPos);
+		const FString FromPinName = FromStr.RightChop(DotPos + 1);
+
+		if (!ToStr.FindChar('.', DotPos))
+		{
+			if (bWarnOnMalformed) OutWarnings.Add(FString::Printf(TEXT("Invalid connection target: %s"), *ToStr));
+			continue;
+		}
+		const FString ToNodeId = ToStr.Left(DotPos);
+		const FString ToPinName = ToStr.RightChop(DotPos + 1);
+
+		UEdGraphNode* const* FromNodePtr = IdToNode.Find(FromNodeId);
+		UEdGraphNode* const* ToNodePtr = IdToNode.Find(ToNodeId);
+		if (!FromNodePtr || !ToNodePtr)
+		{
+			if (bWarnOnMalformed)
+			{
+				OutWarnings.Add(FString::Printf(TEXT("Connection node not found: %s -> %s"), *FromNodeId, *ToNodeId));
+			}
+			continue;
+		}
+
+		UEdGraphPin* FromPin = FindPin(*FromNodePtr, FromPinName);
+		UEdGraphPin* ToPin = FindPin(*ToNodePtr, ToPinName);
+		if (!FromPin || !ToPin)
+		{
+			if (bWarnOnMalformed)
+			{
+				OutWarnings.Add(FString::Printf(TEXT("Connection pin not found: %s -> %s"), *FromStr, *ToStr));
+			}
+			continue;
+		}
+
+		FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
+		if (Response.Response == CONNECT_RESPONSE_DISALLOW)
+		{
+			if (bWarnOnMalformed)
+			{
+				OutWarnings.Add(FString::Printf(TEXT("Cannot connect %s -> %s: %s"),
+					*FromStr, *ToStr, *Response.Message.ToString()));
+			}
+			continue;
+		}
+
+		Schema->TryCreateConnection(FromPin, ToPin);
+	}
+}
 
 FString UCreateBlueprintFromJsonTool::GetToolDescription() const
 {
@@ -167,15 +499,16 @@ FBridgeToolResult UCreateBlueprintFromJsonTool::Execute(
 	}
 
 	// ── Create or load blueprint ────────────────────────────────────────
-	UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *AssetPath);
+	const FString PackageName = FPackageName::ObjectPathToPackageName(AssetPath);
+	const FString AssetName = FPackageName::GetLongPackageAssetName(PackageName);
+	const FString ObjectPath = PackageName + TEXT(".") + AssetName;
+
+	UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *ObjectPath);
 	const bool bIsNew = (Blueprint == nullptr);
 
 	if (bIsNew)
 	{
-		FString PackagePath = FPackageName::GetLongPackagePath(AssetPath);
-		FString AssetName = FPackageName::GetShortName(AssetPath);
-
-		UPackage* Pkg = CreatePackage(*AssetPath);
+		UPackage* Pkg = CreatePackage(*PackageName);
 		if (!Pkg)
 		{
 			return FBridgeToolResult::Error(TEXT("Failed to create package"));
@@ -196,14 +529,59 @@ FBridgeToolResult UCreateBlueprintFromJsonTool::Execute(
 	}
 	else
 	{
-		// Existing blueprint: clear the event graph
-		for (UEdGraph* Graph : Blueprint->UbergraphPages)
+// Existing blueprint: clear everything (JSON is source of truth)
+// 1. Remove event graph nodes properly
+for (UEdGraph* Graph : Blueprint->UbergraphPages)
+{
+	if (Graph)
+	{
+		TArray<UEdGraphNode*> NodesToRemove = Graph->Nodes;
+		for (UEdGraphNode* N : NodesToRemove)
 		{
-			if (Graph)
-			{
-				Graph->Nodes.Empty();
-			}
+			if (N) Graph->RemoveNode(N);
 		}
+	}
+}
+// 2. Remove existing function graphs (except defaults)
+{
+	TArray<UEdGraph*> FuncsToRemove;
+	for (UEdGraph* FG : Blueprint->FunctionGraphs)
+	{
+		if (FG && FG->GetName() != TEXT("UserConstructionScript"))
+			FuncsToRemove.Add(FG);
+	}
+	for (UEdGraph* FG : FuncsToRemove)
+	{
+		FBlueprintEditorUtils::RemoveGraph(Blueprint, FG);
+	}
+}
+// 3. Remove existing macro graphs
+{
+	TArray<UEdGraph*> MacrosToRemove = Blueprint->MacroGraphs;
+	for (UEdGraph* MG : MacrosToRemove)
+	{
+		if (MG) FBlueprintEditorUtils::RemoveGraph(Blueprint, MG);
+	}
+}
+// 4. Clear old variables (re-added from JSON below)
+Blueprint->NewVariables.Empty();
+// 5. Remove old SCS components
+if (Blueprint->SimpleConstructionScript)
+{
+	while (Blueprint->SimpleConstructionScript->GetAllNodes().Num() > 0)
+	{
+		USCS_Node* SCSNode = Blueprint->SimpleConstructionScript->GetAllNodes()[0];
+		Blueprint->SimpleConstructionScript->RemoveNode(SCSNode);
+	}
+}
+// 6. Remove old timelines
+{
+	TArray<UTimelineTemplate*> OldTimelines = Blueprint->Timelines;
+	for (UTimelineTemplate* TL : OldTimelines)
+	{
+		if (TL) FBlueprintEditorUtils::RemoveTimeline(Blueprint, TL);
+	}
+}
 	}
 
 	FBridgeAssetModifier::MarkModified(Blueprint);
@@ -231,6 +609,11 @@ FBridgeToolResult UCreateBlueprintFromJsonTool::Execute(
 				Warnings.Add(FString::Printf(TEXT("Skipping variable with missing name/type")));
 				continue;
 			}
+
+			// Remove old variable if it exists (JSON is source of truth)
+			Blueprint->NewVariables.RemoveAll([&](const FBPVariableDescription& V) {
+				return V.VarName == FName(*VarName);
+			});
 
 			FBPVariableDescription NewVar;
 			NewVar.VarName = FName(*VarName);
@@ -324,6 +707,8 @@ FBridgeToolResult UCreateBlueprintFromJsonTool::Execute(
 			if (!CompCls) CompCls = FindFirstObject<UClass>(*(TEXT("U") + CompClass), EFindFirstObjectOptions::None);
 			if (!CompCls) continue;
 
+			// Skip if component already exists
+			if (Blueprint->SimpleConstructionScript->FindSCSNode(FName(*CompName))) continue;
 			USCS_Node* NewNode = Blueprint->SimpleConstructionScript->CreateNode(CompCls, FName(*CompName));
 			if (!NewNode) continue;
 
@@ -365,14 +750,192 @@ FBridgeToolResult UCreateBlueprintFromJsonTool::Execute(
 
 				FString ValueStr;
 				if (!Pair.Value->TryGetString(ValueStr)) continue;
-				Prop->ImportText_Direct(*ValueStr, ValuePtr, Template, PPF_None);
+
+				bool bHandled = false;
+				if (FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop))
+				{
+					FObjectPropertyBase* InnerObj = CastField<FObjectPropertyBase>(ArrProp->Inner);
+					const bool bIsInstancedObjectArray =
+						InnerObj &&
+						InnerObj->PropertyClass &&
+						(ArrProp->HasAnyPropertyFlags(CPF_ContainsInstancedReference) ||
+						 InnerObj->HasAnyPropertyFlags(CPF_InstancedReference | CPF_ContainsInstancedReference));
+					if (bIsInstancedObjectArray)
+					{
+						bHandled = true;
+						FScriptArrayHelper ArrHelper(ArrProp, ValuePtr);
+						ArrHelper.EmptyValues();
+						FString Content = ValueStr.TrimStartAndEnd();
+						if (Content.StartsWith(TEXT("\"")) && Content.EndsWith(TEXT("\"")))
+							Content = Content.Mid(1, Content.Len() - 2);
+						if (Content.StartsWith(TEXT("(")) && Content.EndsWith(TEXT(")")))
+						{
+							Content = Content.Mid(1, Content.Len() - 2).TrimStartAndEnd();
+							if (!Content.IsEmpty())
+							{
+								TArray<FString> Elems;
+								SplitTopLevelArrayElements(Content, Elems);
+								for (FString& Elem : Elems)
+								{
+									FString ClassPath;
+									FString SourceObjectPath;
+									if (ParseObjectExportText(Elem, ClassPath, SourceObjectPath))
+									{
+										FString Err;
+										UClass* ObjClass = FBridgePropertySerializer::ResolveClass(ClassPath, Err);
+										if (!ObjClass)
+										{
+											ObjClass = LoadClass<UObject>(nullptr, *ClassPath);
+										}
+										if (ObjClass && ObjClass->IsChildOf(InnerObj->PropertyClass))
+										{
+											UObject* NewObj = nullptr;
+											if (!SourceObjectPath.IsEmpty())
+											{
+												if (UObject* SourceObj = LoadObject<UObject>(nullptr, *SourceObjectPath))
+												{
+													if (SourceObj->IsA(ObjClass))
+													{
+														const FName NewName = MakeUniqueObjectName(Template, ObjClass, SourceObj->GetFName());
+														NewObj = DuplicateObject<UObject>(SourceObj, Template, NewName);
+													}
+												}
+											}
+											if (!NewObj)
+											{
+												NewObj = NewObject<UObject>(Template, ObjClass, NAME_None, RF_Transactional);
+											}
+											if (NewObj)
+											{
+												NewObj->SetFlags(RF_Transactional);
+												int32 Idx = ArrHelper.AddValue();
+												*reinterpret_cast<UObject**>(ArrHelper.GetRawPtr(Idx)) = NewObj;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				if (!bHandled)
+				{
+					Prop->ImportText_Direct(*ValueStr, ValuePtr, Template, PPF_None);
+				}
 			}
 		}
 		FKismetEditorUtilities::CompileBlueprint(Blueprint);
 	}
 
+	// ── Function graphs ────────────────────────────────────────────────
+	const TArray<TSharedPtr<FJsonValue>>* FunctionGraphsArray2 = nullptr;
+	if (Args->TryGetArrayField(TEXT("function_graphs"), FunctionGraphsArray2))
+	{
+		for (const TSharedPtr<FJsonValue>& FgVal : *FunctionGraphsArray2)
+		{
+			const TSharedPtr<FJsonObject>* FgObjPtr = nullptr;
+			if (!FgVal->TryGetObject(FgObjPtr)) continue;
+			const TSharedPtr<FJsonObject>& FgObj = *FgObjPtr;
+
+			FString GraphName = FgObj->GetStringField(TEXT("name"));
+			if (GraphName.IsEmpty()) continue;
+			if (GraphName == TEXT("UserConstructionScript")) continue;
+
+			UEdGraph* FuncGraph = FBlueprintEditorUtils::CreateNewGraph(
+				Blueprint, FName(*GraphName),
+				UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+			if (!FuncGraph) continue;
+
+			FBlueprintEditorUtils::AddFunctionGraph(Blueprint, FuncGraph, true, static_cast<UFunction*>(nullptr));
+
+				// Clear any auto-created or residual nodes
+				{ TArray<UEdGraphNode*> FGNTR = FuncGraph->Nodes; for (UEdGraphNode* N : FGNTR) { if (N) FuncGraph->RemoveNode(N); } }
+
+			const TArray<TSharedPtr<FJsonValue>>* FgNodes = nullptr;
+			const TArray<TSharedPtr<FJsonValue>>* FgConns = nullptr;
+			FgObj->TryGetArrayField(TEXT("nodes"), FgNodes);
+			FgObj->TryGetArrayField(TEXT("connections"), FgConns);
+
+			TMap<FString, UEdGraphNode*> FgIdToNode;
+			TArray<FString> DummyWarnings;
+			const UEdGraphSchema* FgSchema = FuncGraph->GetSchema();
+
+			if (FgNodes)
+			{
+				for (const TSharedPtr<FJsonValue>& Nv : *FgNodes)
+				{
+					const TSharedPtr<FJsonObject>* NoPtr = nullptr;
+					if (!Nv->TryGetObject(NoPtr)) continue;
+					FString Nid = (*NoPtr)->GetStringField(TEXT("id"));
+					UEdGraphNode* Node = CreateNode(Blueprint, FuncGraph, *NoPtr, FgIdToNode, DummyWarnings);
+					if (!Node) continue;
+					FgIdToNode.Add(Nid, Node);
+
+					ApplyPromotablePinTypes(Node, *NoPtr);
+					ApplySerializedPinDefaults(Node, *NoPtr, FgSchema, true);
+				}
+			}
+
+			ConnectSerializedPins(FgConns, FgIdToNode, FgSchema, DummyWarnings, false);
+		}
+	}
+
+	// ── Macro graphs ───────────────────────────────────────────────────
+	const TArray<TSharedPtr<FJsonValue>>* MacroGraphsArray2 = nullptr;
+	if (Args->TryGetArrayField(TEXT("macro_graphs"), MacroGraphsArray2))
+	{
+		for (const TSharedPtr<FJsonValue>& MgVal : *MacroGraphsArray2)
+		{
+			const TSharedPtr<FJsonObject>* MgObjPtr = nullptr;
+			if (!MgVal->TryGetObject(MgObjPtr)) continue;
+			const TSharedPtr<FJsonObject>& MgObj = *MgObjPtr;
+
+			FString GraphName = MgObj->GetStringField(TEXT("name"));
+			if (GraphName.IsEmpty()) continue;
+
+			UEdGraph* MacroGraph = FBlueprintEditorUtils::CreateNewGraph(
+				Blueprint, FName(*GraphName),
+				UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+			if (!MacroGraph) continue;
+
+			Blueprint->MacroGraphs.Add(MacroGraph);
+			{ TArray<UEdGraphNode*> MGNTR = MacroGraph->Nodes; for (UEdGraphNode* N : MGNTR) { if (N) MacroGraph->RemoveNode(N); } }
+
+			const TArray<TSharedPtr<FJsonValue>>* MgNodes = nullptr;
+			const TArray<TSharedPtr<FJsonValue>>* MgConns = nullptr;
+			MgObj->TryGetArrayField(TEXT("nodes"), MgNodes);
+			MgObj->TryGetArrayField(TEXT("connections"), MgConns);
+
+			TMap<FString, UEdGraphNode*> MgIdToNode;
+			TArray<FString> DummyWarnings;
+			const UEdGraphSchema* MgSchema = MacroGraph->GetSchema();
+
+			if (MgNodes)
+			{
+				for (const TSharedPtr<FJsonValue>& Nv : *MgNodes)
+				{
+					const TSharedPtr<FJsonObject>* NoPtr = nullptr;
+					if (!Nv->TryGetObject(NoPtr)) continue;
+					FString Nid = (*NoPtr)->GetStringField(TEXT("id"));
+					UEdGraphNode* Node = CreateNode(Blueprint, MacroGraph, *NoPtr, MgIdToNode, DummyWarnings);
+					if (!Node) continue;
+					MgIdToNode.Add(Nid, Node);
+
+					ApplyPromotablePinTypes(Node, *NoPtr);
+					ApplySerializedPinDefaults(Node, *NoPtr, MgSchema, false);
+				}
+			}
+
+			ConnectSerializedPins(MgConns, MgIdToNode, MgSchema, DummyWarnings, false);
+		}
+	}
+
+
+	FKismetEditorUtilities::CompileBlueprint(Blueprint);
+
 	// ── Graph nodes (skip for data-only blueprints) ────────────────────────────────────────
 	TMap<FString, UEdGraphNode*> IdToNode;
+	TArray<FString> NodeErrors;
 
 	if (NodesArray->Num() > 0)
 	{
@@ -400,10 +963,7 @@ FBridgeToolResult UCreateBlueprintFromJsonTool::Execute(
 			}
 		}
 
-		// ── Create nodes ────────────────────────────────────────────────────
-TArray<FString> NodeErrors;
-
-		// Create Timeline templates (before nodes so AllocateDefaultPins finds them)
+		// ── Create nodes ────────────────────────────────────────────────────		// Create Timelineine templates (before nodes so AllocateDefaultPins finds them)
 	const TArray<TSharedPtr<FJsonValue>>* TimelinesArray = nullptr;
 	if (Args->TryGetArrayField(TEXT("timelines"), TimelinesArray))
 	{
@@ -474,6 +1034,8 @@ TArray<FString> NodeErrors;
 						Template->LinearColorTracks.Add(Track);
 						Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_LinearColorInterp, Template->LinearColorTracks.Num() - 1));
 					}
+				}
+
 					// Restore curve keys and settings
 				{
 					auto RestoreRichCurve = [](FRichCurve& Curve, const TSharedPtr<FJsonObject>& TrObj) {
@@ -531,7 +1093,7 @@ TArray<FString> NodeErrors;
 						}
 					};
 
-					int32 EvtIdx = 0, FltIdx = 0;
+					int32 EvtIdx = 0, FltIdx = 0, VecIdx = 0, LinIdx = 0;
 					for (const TSharedPtr<FJsonValue>& TrVal : *TracksArray)
 					{
 						const TSharedPtr<FJsonObject>* TrObj = nullptr;
@@ -551,12 +1113,19 @@ TArray<FString> NodeErrors;
 								RestoreRichCurve(Template->FloatTracks[FltIdx].CurveFloat->FloatCurve, *TrObj);
 							FltIdx++;
 						}
+						else if (TrType == TEXT("vector") && VecIdx < Template->VectorTracks.Num())
+						{
+							if (Template->VectorTracks[VecIdx].CurveVector)
+								RestoreRichCurve(Template->VectorTracks[VecIdx].CurveVector->FloatCurves[0], *TrObj);
+							VecIdx++;
+						}
+						else if (TrType == TEXT("linear_color") && LinIdx < Template->LinearColorTracks.Num())
+						{
+							if (Template->LinearColorTracks[LinIdx].CurveLinearColor)
+								RestoreRichCurve(Template->LinearColorTracks[LinIdx].CurveLinearColor->FloatCurves[0], *TrObj);
+							LinIdx++;
+						}
 					}
-				}
-			}
-		}
-	}
-
 				}
 			}
 		}
@@ -581,195 +1150,12 @@ TArray<FString> NodeErrors;
 		FString NodeId = NodeObj->GetStringField(TEXT("id"));
 		IdToNode.Add(NodeId, Node);
 
-		// Fix up PromotableOperator pin types that AllocateDefaultPins resolves wrong
-		if (Cast<UK2Node_PromotableOperator>(Node))
-		{
-			const TSharedPtr<FJsonObject>* PinTypesObj2 = nullptr;
-			if (NodeObj->TryGetObjectField(TEXT("pin_types"), PinTypesObj2))
-			{
-				for (const auto& Pair : (*PinTypesObj2)->Values)
-				{
-					UEdGraphPin* Pin = FindPin(Node, Pair.Key);
-					if (!Pin) continue;
-					FString TypeStr = Pair.Value->AsString();
-					FString Cat, Sub;
-					if (TypeStr.Split(TEXT("/"), &Cat, &Sub))
-					{
-						Pin->PinType.PinCategory = FName(*Cat);
-						Pin->PinType.PinSubCategory = Sub.IsEmpty() ? NAME_None : FName(*Sub);
-						Pin->PinType.PinSubCategoryObject = nullptr;
-						if (!Sub.IsEmpty() && Sub != TEXT("float"))
-						{
-							UObject* SubObj = StaticFindObject(UObject::StaticClass(), nullptr, *Sub);
-							if (!SubObj) SubObj = FindFirstObject<UClass>(*Sub, EFindFirstObjectOptions::None);
-							if (!SubObj) SubObj = FindFirstObject<UScriptStruct>(*Sub, EFindFirstObjectOptions::ExactClass);
-							if (SubObj) Pin->PinType.PinSubCategoryObject = SubObj;
-						}
-					}
-					else
-					{
-						Pin->PinType.PinCategory = FName(*TypeStr);
-						Pin->PinType.PinSubCategory = NAME_None;
-						Pin->PinType.PinSubCategoryObject = nullptr;
-					}
-				}
-			}
-		}
-
-		// Apply pin default values
-
-		// Apply pin default values
-		const TSharedPtr<FJsonObject>* DefaultsObj = nullptr;
-		if (NodeObj->TryGetObjectField(TEXT("defaults"), DefaultsObj))
-		{
-			for (const auto& Pair : (*DefaultsObj)->Values)
-			{
-				UEdGraphPin* Pin = FindPin(Node, Pair.Key);
-				if (Pin)
-				{
-					FString StrVal;
-					if (Pair.Value->Type == EJson::String)
-					{
-						StrVal = Pair.Value->AsString();
-					}
-					else if (Pair.Value->Type == EJson::Number)
-					{
-						StrVal = FString::Printf(TEXT("%g"), Pair.Value->AsNumber());
-					}
-					else if (Pair.Value->Type == EJson::Boolean)
-					{
-						StrVal = Pair.Value->AsBool() ? TEXT("true") : TEXT("false");
-					}
-					else
-					{
-						StrVal = Pair.Value->AsString();
-					}
-
-					if (!StrVal.IsEmpty())
-					{
-						Pin->DefaultValue = StrVal;
-					}
-				}
-			}
-		}
+		ApplyPromotablePinTypes(Node, NodeObj);
+		ApplySerializedPinDefaults(Node, NodeObj, Schema, false);
 	}
-
-// Apply pin default objects (class/object pins)
-			const TSharedPtr<FJsonObject>* DefaultObjsObj = nullptr;
-			if (NodeObj->TryGetObjectField(TEXT("default_objects"), DefaultObjsObj))
-			{
-				const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(Schema);
-				if (K2Schema)
-				{
-					for (const auto& Pair : (*DefaultObjsObj)->Values)
-					{
-						UEdGraphPin* Pin2 = FindPin(Node, Pair.Key);
-						if (Pin2)
-						{
-							FString ObjPath = Pair.Value->AsString();
-							if (!ObjPath.IsEmpty())
-							{
-								K2Schema->SetPinDefaultValueAtConstruction(Pin2, ObjPath);
-							}
-						}
-					}
-				}
-			}
-		}
-	}
-
-
 
 	// ── Create connections ──────────────────────────────────────────────
-	if (ConnectionsArray)
-	{
-		for (const TSharedPtr<FJsonValue>& ConnVal : *ConnectionsArray)
-		{
-			FString FromStr, ToStr;
-
-			// Support both array ["from", "to"] and object {from, to} formats
-			const TSharedPtr<FJsonObject>* ConnObjPtr = nullptr;
-			if (ConnVal->TryGetObject(ConnObjPtr))
-			{
-				(*ConnObjPtr)->TryGetStringField(TEXT("from"), FromStr);
-				(*ConnObjPtr)->TryGetStringField(TEXT("to"), ToStr);
-			}
-			else
-			{
-				const TArray<TSharedPtr<FJsonValue>>* ConnArr = nullptr;
-				if (ConnVal->TryGetArray(ConnArr) && ConnArr->Num() >= 2)
-				{
-					FromStr = (*ConnArr)[0]->AsString();
-					ToStr = (*ConnArr)[1]->AsString();
-				}
-			}
-
-			if (FromStr.IsEmpty() || ToStr.IsEmpty())
-			{
-				Warnings.Add(TEXT("Skipping malformed connection"));
-				continue;
-			}
-
-			// Parse "node_id.pin_name"
-			int32 DotPos;
-			FString FromNodeId, FromPinName, ToNodeId, ToPinName;
-
-			if (!FromStr.FindChar('.', DotPos))
-			{
-				Warnings.Add(FString::Printf(TEXT("Invalid connection source: %s"), *FromStr));
-				continue;
-			}
-			FromNodeId = FromStr.Left(DotPos);
-			FromPinName = FromStr.RightChop(DotPos + 1);
-
-			if (!ToStr.FindChar('.', DotPos))
-			{
-				Warnings.Add(FString::Printf(TEXT("Invalid connection target: %s"), *ToStr));
-				continue;
-			}
-			ToNodeId = ToStr.Left(DotPos);
-			ToPinName = ToStr.RightChop(DotPos + 1);
-
-			UEdGraphNode** FromNodePtr = IdToNode.Find(FromNodeId);
-			UEdGraphNode** ToNodePtr = IdToNode.Find(ToNodeId);
-
-			if (!FromNodePtr)
-			{
-				Warnings.Add(FString::Printf(TEXT("Connection source node not found: %s"), *FromNodeId));
-				continue;
-			}
-			if (!ToNodePtr)
-			{
-				Warnings.Add(FString::Printf(TEXT("Connection target node not found: %s"), *ToNodeId));
-				continue;
-			}
-
-			UEdGraphPin* FromPin = FindPin(*FromNodePtr, FromPinName);
-			UEdGraphPin* ToPin = FindPin(*ToNodePtr, ToPinName);
-
-			if (!FromPin)
-			{
-				Warnings.Add(FString::Printf(TEXT("Source pin not found: %s.%s"), *FromNodeId, *FromPinName));
-				continue;
-			}
-			if (!ToPin)
-			{
-				Warnings.Add(FString::Printf(TEXT("Target pin not found: %s.%s"), *ToNodeId, *ToPinName));
-				continue;
-			}
-
-			FPinConnectionResponse Response = Schema->CanCreateConnection(FromPin, ToPin);
-			if (Response.Response == CONNECT_RESPONSE_DISALLOW)
-			{
-				Warnings.Add(FString::Printf(TEXT("Cannot connect %s.%s -> %s.%s: %s"),
-					*FromNodeId, *FromPinName, *ToNodeId, *ToPinName,
-					*Response.Message.ToString()));
-				continue;
-			}
-
-			Schema->TryCreateConnection(FromPin, ToPin);
-		}
-			}
+	ConnectSerializedPins(ConnectionsArray, IdToNode, Schema, Warnings, true);
 	} // end graph node block
 
 	// ── Apply CDO defaults ──────────────────────────────────────────────
@@ -812,11 +1198,121 @@ TArray<FString> NodeErrors;
 					void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Container);
 					if (!ValuePtr) continue;
 
-					Prop->ImportText_Direct(*DefaultValue, ValuePtr, CDO, PPF_None);
+					// Instanced object arrays: ImportText would import references to
+					// the source CDO subobjects. Duplicate them onto this CDO instead.
+					bool bHandled = false;
+					if (FArrayProperty* ArrProp = CastField<FArrayProperty>(Prop))
+					{
+						FObjectPropertyBase* InnerObj = CastField<FObjectPropertyBase>(ArrProp->Inner);
+						const bool bIsInstancedObjectArray =
+							InnerObj &&
+							InnerObj->PropertyClass &&
+							(ArrProp->HasAnyPropertyFlags(CPF_ContainsInstancedReference) ||
+							 InnerObj->HasAnyPropertyFlags(CPF_InstancedReference | CPF_ContainsInstancedReference));
+						if (bIsInstancedObjectArray)
+						{
+							bHandled = true;
+							FScriptArrayHelper ArrHelper(ArrProp, ValuePtr);
+							ArrHelper.EmptyValues();
+							FString Content = DefaultValue.TrimStartAndEnd();
+							if (Content.StartsWith(TEXT("\"")) && Content.EndsWith(TEXT("\"")))
+								Content = Content.Mid(1, Content.Len() - 2);
+							if (Content.StartsWith(TEXT("(")) && Content.EndsWith(TEXT(")")))
+							{
+								Content = Content.Mid(1, Content.Len() - 2).TrimStartAndEnd();
+								if (!Content.IsEmpty())
+								{
+									TArray<FString> Elems;
+									SplitTopLevelArrayElements(Content, Elems);
+									for (FString& Elem : Elems)
+									{
+										FString ClassPath;
+										FString SourceObjectPath;
+										if (ParseObjectExportText(Elem, ClassPath, SourceObjectPath))
+										{
+											FString Err;
+											UClass* ObjClass = FBridgePropertySerializer::ResolveClass(ClassPath, Err);
+											if (!ObjClass)
+											{
+												ObjClass = LoadClass<UObject>(nullptr, *ClassPath);
+											}
+											if (ObjClass && ObjClass->IsChildOf(InnerObj->PropertyClass))
+											{
+												UObject* NewObj = nullptr;
+												if (!SourceObjectPath.IsEmpty())
+												{
+													if (UObject* SourceObj = LoadObject<UObject>(nullptr, *SourceObjectPath))
+													{
+														if (SourceObj->IsA(ObjClass))
+														{
+															const FName NewName = MakeUniqueObjectName(CDO, ObjClass, SourceObj->GetFName());
+															NewObj = DuplicateObject<UObject>(SourceObj, CDO, NewName);
+														}
+													}
+												}
+												if (!NewObj)
+												{
+													NewObj = NewObject<UObject>(CDO, ObjClass, NAME_None, RF_Transactional);
+												}
+												if (NewObj)
+												{
+													NewObj->SetFlags(RF_Transactional);
+												}
+												int32 Idx = ArrHelper.AddValue();
+												*reinterpret_cast<UObject**>(ArrHelper.GetRawPtr(Idx)) = NewObj;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					if (!bHandled)
+					{
+						Prop->ImportText_Direct(*DefaultValue, ValuePtr, CDO, PPF_None);
+					}
 				}
 			}
 		}
 	}
+
+#if WITH_EDITOR
+	// ---- Auto-create GE Components from CDO properties ----
+	{
+		UObject* GE_CDO = Blueprint->GeneratedClass ? Blueprint->GeneratedClass->GetDefaultObject() : nullptr;
+		if (UGameplayEffect* GE = Cast<UGameplayEffect>(GE_CDO))
+		{
+			const UGameplayEffect* Archetype = Cast<UGameplayEffect>(GE->GetArchetype());
+			if (Archetype)
+			{
+				if (GE->InheritableOwnedTagsContainer != Archetype->InheritableOwnedTagsContainer)
+				{
+					UTargetTagsGameplayEffectComponent& Comp = GE->FindOrAddComponent<UTargetTagsGameplayEffectComponent>();
+					Comp.SetAndApplyTargetTagChanges(GE->InheritableOwnedTagsContainer);
+				}
+				if (GE->InheritableGameplayEffectTags != Archetype->InheritableGameplayEffectTags)
+				{
+					UAssetTagsGameplayEffectComponent& Comp = GE->FindOrAddComponent<UAssetTagsGameplayEffectComponent>();
+					Comp.SetAndApplyAssetTagChanges(GE->InheritableGameplayEffectTags);
+				}
+				if (GE->InheritableBlockedAbilityTagsContainer != Archetype->InheritableBlockedAbilityTagsContainer)
+				{
+					UBlockAbilityTagsGameplayEffectComponent& Comp = GE->FindOrAddComponent<UBlockAbilityTagsGameplayEffectComponent>();
+					Comp.SetAndApplyBlockedAbilityTagChanges(GE->InheritableBlockedAbilityTagsContainer);
+				}
+				if (GE->ApplicationTagRequirements != Archetype->ApplicationTagRequirements ||
+					GE->OngoingTagRequirements != Archetype->OngoingTagRequirements ||
+					GE->RemovalTagRequirements != Archetype->RemovalTagRequirements)
+				{
+					UTargetTagRequirementsGameplayEffectComponent& Comp = GE->FindOrAddComponent<UTargetTagRequirementsGameplayEffectComponent>();
+					Comp.ApplicationTagRequirements = GE->ApplicationTagRequirements;
+					Comp.OngoingTagRequirements = GE->OngoingTagRequirements;
+					Comp.RemovalTagRequirements = GE->RemovalTagRequirements;
+				}
+			}
+		}
+	}
+#endif
 
 	// ── Compile ─────────────────────────────────────────────────────────
 	FString CompileError;
@@ -842,6 +1338,15 @@ TArray<FString> NodeErrors;
 	}
 	Result->SetArrayField(TEXT("nodes"), NodeGuids);
 
+	if (NodeErrors.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> ErrVals;
+		for (const FString& E : NodeErrors)
+		{
+			ErrVals.Add(MakeShareable(new FJsonValueString(E)));
+		}
+		Result->SetArrayField(TEXT("node_errors"), ErrVals);
+	}
 	if (Warnings.Num() > 0)
 	{
 		TArray<TSharedPtr<FJsonValue>> WarnVals;
@@ -920,6 +1425,56 @@ UEdGraphNode* UCreateBlueprintFromJsonTool::CreateNode(
 			}
 			// Fall through to generic loop so EventReference gets set too
 		}
+		else if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+		{
+			if (!Cast<UK2Node_ComponentBoundEvent>(Node))
+			{
+				FString EventName;
+				if ((!NodeJson->TryGetStringField(TEXT("event"), EventName) || EventName.IsEmpty()) &&
+					(!NodeJson->TryGetStringField(TEXT("event_name"), EventName) || EventName.IsEmpty()))
+				{
+					EventName.Reset();
+				}
+
+				if (!EventName.IsEmpty())
+				{
+					UFunction* Func = Blueprint->GeneratedClass
+						? Blueprint->GeneratedClass->FindFunctionByName(*EventName)
+						: nullptr;
+					if (!Func)
+					{
+						Func = FindFunctionByName(EventName, Blueprint->ParentClass);
+					}
+
+					if (Func)
+					{
+						EventNode->EventReference.SetFromField<UFunction>(Func, false);
+						EventNode->bOverrideFunction = true;
+					}
+				}
+			}
+		}
+		// FunctionEntry: needs FunctionReference set to a self-member so the
+		// compiler identifies this graph as implementing that function.
+		if (UK2Node_FunctionEntry* EntryNode = Cast<UK2Node_FunctionEntry>(Node))
+		{
+			FString EventName;
+			if (NodeJson->TryGetStringField(TEXT("event"), EventName) && !EventName.IsEmpty())
+			{
+				EntryNode->FunctionReference.SetSelfMember(FName(*EventName));
+			}
+		}
+
+		// FunctionResult: similar to FunctionEntry
+		if (UK2Node_FunctionResult* ResultNode = Cast<UK2Node_FunctionResult>(Node))
+		{
+			FString EventName;
+			if (NodeJson->TryGetStringField(TEXT("event"), EventName) && !EventName.IsEmpty())
+			{
+				ResultNode->FunctionReference.SetSelfMember(FName(*EventName));
+			}
+		}
+
 
 		for (TFieldIterator<FStructProperty> It(Node->GetClass(), EFieldIteratorFlags::IncludeSuper); It; ++It)
 		{
@@ -956,17 +1511,47 @@ UEdGraphNode* UCreateBlueprintFromJsonTool::CreateNode(
 			}
 			else if (JsonField == TEXT("variable"))
 			{
-				// Variables default to self context (defined in this blueprint)
-				Ref->SetSelfMember(FName(*MemberName));
+				// Function parameters are local-scope variables in K2. If a
+				// variable node is in a function graph and matches an entry pin,
+				// bind it locally; otherwise default to a blueprint member.
+				bool bBoundLocalFunctionParam = false;
+				const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(Graph ? Graph->GetSchema() : nullptr);
+				if (K2Schema && K2Schema->GetGraphType(Graph) == GT_Function)
+				{
+					TArray<UK2Node_FunctionEntry*> EntryNodes;
+					Graph->GetNodesOfClass(EntryNodes);
+					for (UK2Node_FunctionEntry* EntryNode : EntryNodes)
+					{
+						if (!EntryNode)
+						{
+							continue;
+						}
+						if (UEdGraphPin* EntryPin = EntryNode->FindPin(FName(*MemberName), EGPD_Output))
+						{
+							UEdGraph* TopLevelGraph = FBlueprintEditorUtils::GetTopLevelGraph(Graph);
+							Ref->SetLocalMember(FName(*MemberName), TopLevelGraph ? TopLevelGraph->GetName() : Graph->GetName(), EntryPin->PersistentGuid);
+							bBoundLocalFunctionParam = true;
+							break;
+						}
+					}
+				}
+				if (!bBoundLocalFunctionParam)
+				{
+					Ref->SetSelfMember(FName(*MemberName));
+				}
 			}
 			else
 			{
 				// Events/functions: search parent class hierarchy
-				UFunction* Func = FindFunctionByName(MemberName, Blueprint->ParentClass);
+				UFunction* Func = Blueprint->GeneratedClass
+					? Blueprint->GeneratedClass->FindFunctionByName(*MemberName)
+					: nullptr;
+				if (!Func)
+					Func = FindFunctionByName(MemberName, Blueprint->ParentClass);
 				if (Func)
 					Ref->SetExternalMember(FName(*MemberName), Func->GetOuterUClass());
 				else
-					Ref->SetExternalMember(FName(*MemberName), Blueprint->ParentClass);
+					Ref->SetExternalMember(FName(*MemberName), Blueprint->GeneratedClass);
 			}
 		}
 
@@ -990,12 +1575,55 @@ UEdGraphNode* UCreateBlueprintFromJsonTool::CreateNode(
 		if (UK2Node_ComponentBoundEvent* CompNode = Cast<UK2Node_ComponentBoundEvent>(Node))
 		{
 			FString Val;
+			FName ComponentName;
+			FName DelegateName;
 			if (NodeJson->TryGetStringField(TEXT("component_name"), Val) && !Val.IsEmpty())
-				CompNode->ComponentPropertyName = FName(*Val);
+			{
+				ComponentName = FName(*Val);
+				CompNode->ComponentPropertyName = ComponentName;
+			}
 			if (NodeJson->TryGetStringField(TEXT("delegate_name"), Val) && !Val.IsEmpty())
-				CompNode->DelegatePropertyName = FName(*Val);
+			{
+				DelegateName = FName(*Val);
+				CompNode->DelegatePropertyName = DelegateName;
+			}
 			if (NodeJson->TryGetStringField(TEXT("delegate_owner_class"), Val) && !Val.IsEmpty())
 				CompNode->DelegateOwnerClass = LoadClass<UObject>(nullptr, *Val);
+
+			FObjectProperty* ComponentProp = nullptr;
+			if (!ComponentName.IsNone())
+			{
+				if (Blueprint->SkeletonGeneratedClass)
+				{
+					ComponentProp = FindFProperty<FObjectProperty>(Blueprint->SkeletonGeneratedClass, ComponentName);
+				}
+				if (!ComponentProp && Blueprint->GeneratedClass)
+				{
+					ComponentProp = FindFProperty<FObjectProperty>(Blueprint->GeneratedClass, ComponentName);
+				}
+			}
+
+			FMulticastDelegateProperty* DelegateProp = nullptr;
+			if (!DelegateName.IsNone() && CompNode->DelegateOwnerClass)
+			{
+				DelegateProp = FindFProperty<FMulticastDelegateProperty>(CompNode->DelegateOwnerClass, DelegateName);
+			}
+
+			if (ComponentProp && DelegateProp)
+			{
+				CompNode->InitializeComponentBoundEventParams(ComponentProp, DelegateProp);
+			}
+			else if (DelegateProp && DelegateProp->SignatureFunction)
+			{
+				CompNode->EventReference.SetFromField<UFunction>(DelegateProp->SignatureFunction, false);
+				CompNode->CustomFunctionName = FName(*FString::Printf(TEXT("BndEvt__%s_%s_%s_%s"),
+					*Blueprint->GetName(),
+					*ComponentName.ToString(),
+					*CompNode->GetName(),
+					*CompNode->EventReference.GetMemberName().ToString()));
+				CompNode->bOverrideFunction = false;
+				CompNode->bInternalEvent = true;
+			}
 		}
 
 		// DynamicCast: JSON "cast_to" != property name "TargetType"
@@ -1046,7 +1674,10 @@ UEdGraphNode* UCreateBlueprintFromJsonTool::CreateNode(
 					if (PFCVal.StartsWith(ClassPrefix))
 					{
 						PFCVal = PFCVal.Mid(ClassPrefix.Len());
-						if (PFCVal.EndsWith(TEXT("'"))) PFCVal = PFCVal.LeftChop(1);
+						if (PFCVal.EndsWith(TEXT("'")))
+						{
+							PFCVal = PFCVal.LeftChop(1);
+						}
 					}
 					*Ptr = LoadClass<UObject>(nullptr, *PFCVal);
 				}
@@ -1064,7 +1695,7 @@ UEdGraphNode* UCreateBlueprintFromJsonTool::CreateNode(
 						if (PCVal.StartsWith(ClassPrefix))
 						{
 							PCVal = PCVal.Mid(ClassPrefix.Len());
-							if (PCVal.EndsWith(TEXT("'"))) PCVal = PCVal.LeftChop(1);
+							if (PCVal.EndsWith("'")) PCVal = PCVal.LeftChop(1);
 						}
 						*PCPtr = LoadClass<UObject>(nullptr, *PCVal);
 						if (!*PCPtr)
@@ -1136,6 +1767,89 @@ UEdGraphNode* UCreateBlueprintFromJsonTool::CreateNode(
 	{
 		Node->AllocateDefaultPins();
 	}
+
+	// Function parameters and freshly-created local variables may not have a
+	// backing FProperty until after compile. If UE cannot allocate a variable
+	// pin yet, restore the serialized pin shape so connections can be rebuilt.
+	if (Cast<UK2Node_VariableGet>(Node) || Cast<UK2Node_VariableSet>(Node))
+	{
+		FString VarName;
+		if (NodeJson->TryGetStringField(TEXT("variable"), VarName) && !VarName.IsEmpty())
+		{
+			const TSharedPtr<FJsonObject>* PinTypesObj = nullptr;
+			if (NodeJson->TryGetObjectField(TEXT("pin_types"), PinTypesObj))
+			{
+				for (const auto& Pair : (*PinTypesObj)->Values)
+				{
+					const FString& PinName = Pair.Key;
+					if (PinName == TEXT("self") || PinName == TEXT("execute") || PinName == TEXT("then"))
+					{
+						continue;
+					}
+					if (FindPin(Node, PinName))
+					{
+						continue;
+					}
+
+					EEdGraphPinDirection Direction = EGPD_Output;
+					if (Cast<UK2Node_VariableSet>(Node) && PinName != TEXT("Output_Get"))
+					{
+						Direction = EGPD_Input;
+					}
+
+					UEdGraphPin* NewPin = Node->CreatePin(Direction, NAME_None, FName(*PinName));
+					if (NewPin)
+					{
+						NewPin->PinType = ParseSerializedPinType(Pair.Value->AsString());
+						if (const UEdGraphSchema_K2* K2SchemaForDefaults = GetDefault<UEdGraphSchema_K2>())
+						{
+							K2SchemaForDefaults->SetPinAutogeneratedDefaultValueBasedOnType(NewPin);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Create user-defined pins on FunctionEntry/FunctionResult so compile generates
+	// proper UFunctions with parameters. AllocateDefaultPins skips these when the
+	// UFunction doesn't exist yet.
+	if (UK2Node_EditablePinBase* EditablePinNode = Cast<UK2Node_EditablePinBase>(Node))
+	{
+		const bool bIsEntry = Cast<UK2Node_FunctionEntry>(Node) != nullptr;
+		const bool bIsResult = Cast<UK2Node_FunctionResult>(Node) != nullptr;
+		if (bIsEntry || bIsResult)
+		{
+			const EEdGraphPinDirection PinDir = bIsEntry ? EGPD_Output : EGPD_Input;
+			const TSharedPtr<FJsonObject>* PinTypesObj = nullptr;
+			if (NodeJson->TryGetObjectField(TEXT("pin_types"), PinTypesObj))
+			{
+				for (const auto& Pair : (*PinTypesObj)->Values)
+				{
+					const FString& PinName = Pair.Key;
+					// Skip auto-created pins (exec pins, delegate, etc.)
+					if (PinName == TEXT("then") || PinName == TEXT("execute") ||
+						PinName == TEXT("OutputDelegate") || PinName == TEXT("self"))
+						continue;
+
+					// Check if pin already exists (AllocateDefaultPins may have created it)
+					bool bExists = false;
+					for (UEdGraphPin* ExistingPin : EditablePinNode->Pins)
+					{
+						if (ExistingPin->PinName.ToString().Equals(PinName, ESearchCase::IgnoreCase))
+						{
+							bExists = true;
+							break;
+						}
+					}
+					if (bExists) continue;
+
+					EditablePinNode->CreateUserDefinedPin(FName(*PinName), ParseSerializedPinType(Pair.Value->AsString()), PinDir);
+				}
+			}
+		}
+	}
+
 	Graph->AddNode(Node, false, false);
 
 	// 4. Apply properties via reflection (generic, works for ALL node types)

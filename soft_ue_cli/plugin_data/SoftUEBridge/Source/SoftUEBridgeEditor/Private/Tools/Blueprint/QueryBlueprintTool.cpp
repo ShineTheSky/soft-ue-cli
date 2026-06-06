@@ -9,6 +9,9 @@
 #include "Engine/InheritableComponentHandler.h"
 #include "Engine/TimelineTemplate.h"
 #include "Components/TimelineComponent.h"
+#include "Curves/CurveFloat.h"
+#include "Curves/CurveVector.h"
+#include "Curves/CurveLinearColor.h"
 #include "EdGraph/EdGraph.h"
 #include "K2Node.h"
 #include "K2Node_Event.h"
@@ -921,6 +924,34 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractTimelines(UBlueprint* Bluepr
 		TlObj->SetBoolField(TEXT("b_ignore_time_dilation"), Template->bIgnoreTimeDilation);
 		TlObj->SetStringField(TEXT("guid"), Template->TimelineGuid.ToString());
 
+		// Helper to serialize FRichCurve keys
+		auto RichCurveToJson = [](const FRichCurve& Curve) -> TArray<TSharedPtr<FJsonValue>> {
+			TArray<TSharedPtr<FJsonValue>> KeysArray;
+			for (const FRichCurveKey& Key : Curve.Keys)
+			{
+				TSharedPtr<FJsonObject> K = MakeShareable(new FJsonObject);
+				K->SetNumberField(TEXT("time"), Key.Time);
+				K->SetNumberField(TEXT("value"), Key.Value);
+				K->SetNumberField(TEXT("arrive_tangent"), Key.ArriveTangent);
+				K->SetNumberField(TEXT("leave_tangent"), Key.LeaveTangent);
+				K->SetNumberField(TEXT("arrive_tangent_weight"), Key.ArriveTangentWeight);
+				K->SetNumberField(TEXT("leave_tangent_weight"), Key.LeaveTangentWeight);
+				K->SetNumberField(TEXT("interp_mode"), static_cast<int32>(Key.InterpMode));
+				K->SetNumberField(TEXT("tangent_mode"), static_cast<int32>(Key.TangentMode.GetValue()));
+				K->SetNumberField(TEXT("tangent_weight_mode"), static_cast<int32>(Key.TangentWeightMode.GetValue()));
+				KeysArray.Add(MakeShareable(new FJsonValueObject(K)));
+			}
+			return KeysArray;
+		};
+
+		auto RichCurveSettingsToJson = [](const FRichCurve& Curve) -> TSharedPtr<FJsonObject> {
+			TSharedPtr<FJsonObject> S = MakeShareable(new FJsonObject);
+			S->SetNumberField(TEXT("pre_infinity_extrap"), static_cast<int32>(Curve.PreInfinityExtrap.GetValue()));
+			S->SetNumberField(TEXT("post_infinity_extrap"), static_cast<int32>(Curve.PostInfinityExtrap.GetValue()));
+			S->SetNumberField(TEXT("default_value"), Curve.DefaultValue);
+			return S;
+		};
+
 		// Tracks
 		TArray<TSharedPtr<FJsonValue>> TrackArray;
 
@@ -930,6 +961,11 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractTimelines(UBlueprint* Bluepr
 			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
 			T->SetStringField(TEXT("type"), TEXT("event"));
 			T->SetStringField(TEXT("function_name"), Track.GetFunctionName().ToString());
+			if (Track.CurveKeys)
+				{
+					T->SetArrayField(TEXT("curve_keys"), RichCurveToJson(Track.CurveKeys->FloatCurve));
+					T->SetObjectField(TEXT("curve_settings"), RichCurveSettingsToJson(Track.CurveKeys->FloatCurve));
+				}
 			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
 		}
 
@@ -939,6 +975,11 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractTimelines(UBlueprint* Bluepr
 			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
 			T->SetStringField(TEXT("type"), TEXT("float"));
 			T->SetStringField(TEXT("property_name"), Track.GetPropertyName().ToString());
+			if (Track.CurveFloat)
+				{
+					T->SetArrayField(TEXT("curve_keys"), RichCurveToJson(Track.CurveFloat->FloatCurve));
+					T->SetObjectField(TEXT("curve_settings"), RichCurveSettingsToJson(Track.CurveFloat->FloatCurve));
+				}
 			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
 		}
 
@@ -948,6 +989,14 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractTimelines(UBlueprint* Bluepr
 			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
 			T->SetStringField(TEXT("type"), TEXT("vector"));
 			T->SetStringField(TEXT("property_name"), Track.GetPropertyName().ToString());
+			if (Track.CurveVector)
+			{
+				for (int32 ch = 0; ch < 3; ++ch)
+				{
+					T->SetArrayField(FString::Printf(TEXT("curve_ch%d"), ch), RichCurveToJson(Track.CurveVector->FloatCurves[ch]));
+					T->SetObjectField(FString::Printf(TEXT("curve_ch%d_settings"), ch), RichCurveSettingsToJson(Track.CurveVector->FloatCurves[ch]));
+				}
+			}
 			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
 		}
 
@@ -957,6 +1006,14 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractTimelines(UBlueprint* Bluepr
 			T->SetStringField(TEXT("name"), Track.GetTrackName().ToString());
 			T->SetStringField(TEXT("type"), TEXT("linear_color"));
 			T->SetStringField(TEXT("property_name"), Track.GetPropertyName().ToString());
+			if (Track.CurveLinearColor)
+			{
+				for (int32 ch = 0; ch < 4; ++ch)
+				{
+					T->SetArrayField(FString::Printf(TEXT("curve_ch%d"), ch), RichCurveToJson(Track.CurveLinearColor->FloatCurves[ch]));
+					T->SetObjectField(FString::Printf(TEXT("curve_ch%d_settings"), ch), RichCurveSettingsToJson(Track.CurveLinearColor->FloatCurves[ch]));
+				}
+			}
 			TrackArray.Add(MakeShareable(new FJsonValueObject(T)));
 		}
 

@@ -179,7 +179,7 @@ def compile_bt_text_to_json(text: str) -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "name": bt_name,
-        "blackboard_name": (blackboard_name or f"BB_{bt_name}") if not blackboard_path else "",
+        "blackboard_name": (blackboard_name or f"BB_{bt_name}") if not blackboard_path else (blackboard_path.rsplit('.', 1)[-1] if '.' in blackboard_path else blackboard_path.rsplit('/', 1)[-1]),
         "blackboard_path": blackboard_path,
         "root": root_node,
     }
@@ -464,8 +464,12 @@ def compile_bt_file(bt_path: str | Path) -> dict[str, Any]:
     """Read a .bttxt file (with optional frontmatter) and compile to BehaviorTree JSON."""
     with open(bt_path, "r", encoding="utf-8") as f:
         raw = f.read()
-    text, _ = _strip_bt_frontmatter(raw)
-    return compile_bt_text_to_json(text)
+    text, meta = _strip_bt_frontmatter(raw)
+    payload = compile_bt_text_to_json(text)
+    asset_path = meta.get("asset", "").strip()
+    if asset_path:
+        payload["asset_path"] = asset_path
+    return payload
 
 
 def decompile_bt_file(json_path: str | Path) -> str:

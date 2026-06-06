@@ -1166,6 +1166,97 @@ def cmd_blueprint_to_json(args: argparse.Namespace) -> None:
 
 
 
+
+def cmd_blueprint_to_yaml(args: argparse.Namespace) -> None:
+	"""Export a Blueprint from UE as YAML with node anchors."""
+	from .bp_json_converter import convert_to_create_json
+	from .bp_yaml_converter import json_to_yaml
+
+	asset_path = getattr(args, "asset_path", "")
+	output_path = getattr(args, "output", None)
+
+	bp_json = _run_tool("query-blueprint", {
+		"asset_path": asset_path,
+		"include": "all",
+		"include_inherited": True,
+	})
+	bp_json["component_overrides"] = _run_tool("query-blueprint", {
+		"asset_path": asset_path,
+		"include": "component_overrides",
+	}).get("component_overrides", {})
+
+	graph_json = _run_tool("query-blueprint-graph", {
+		"asset_path": asset_path,
+		"include_positions": True,
+	})
+
+	unified = convert_to_create_json(bp_json, graph_json, asset_path=asset_path)
+	yaml_text = json_to_yaml(unified)
+
+	if output_path:
+		with open(output_path, "w", encoding="utf-8") as f:
+			f.write(yaml_text)
+		print(f"Saved to {output_path}")
+	else:
+		print(yaml_text)
+
+
+def cmd_blueprint_from_yaml(args: argparse.Namespace) -> None:
+	"""Create a Blueprint from a YAML file with node anchors."""
+	from .bp_yaml_converter import yaml_to_json
+
+	yaml_path = getattr(args, "yaml_path", "")
+	asset_path = getattr(args, "asset_path", None)
+
+	with open(yaml_path, "r", encoding="utf-8") as f:
+		yaml_text = f.read()
+
+	blueprint_json = yaml_to_json(yaml_text)
+
+	source_asset = blueprint_json.get("asset_path", "")
+
+	if asset_path:
+		blueprint_json["asset_path"] = asset_path
+	else:
+		asset_path = source_asset
+
+	# Strip self-referencing function_class_path so the bridge resolves
+	# them to the new blueprint instead of the source asset.
+	if source_asset and source_asset != asset_path:
+		_strip_self_ref_func_paths(blueprint_json, source_asset)
+
+	_print_json(_run_tool("create-blueprint-from-json", blueprint_json))
+
+
+def _strip_self_ref_func_paths(bp_json: dict, source_asset: str) -> None:
+	"""Remove function_class_path that points to the source asset so the
+	bridge falls through to self-resolution (GeneratedClass lookup).
+	Also strips GEComponents so the engine auto-creates default ones."""
+	# Source asset: /Game/Foo/BP_Name  →  class paths start with
+	# /Game/Foo/BP_Name.BP_Name_C  or  /Game/Foo/BP_Name.Default__BP_Name_C
+	import re
+	prefix = re.escape(source_asset)
+	pattern = re.compile(r"^" + prefix + r"\b")
+
+	def _strip_from_nodes(nodes: list) -> None:
+		for n in nodes:
+			if not isinstance(n, dict):
+				continue
+			fcp = n.get("function_class_path", "")
+			if fcp and pattern.match(fcp):
+				del n["function_class_path"]
+			vpc = n.get("variable_parent_class", "")
+			if vpc and pattern.match(vpc):
+				del n["variable_parent_class"]
+
+	_strip_from_nodes(bp_json.get("nodes", []))
+	for fg in bp_json.get("function_graphs", []) or []:
+		_strip_from_nodes(fg.get("nodes", []))
+	for mg in bp_json.get("macro_graphs", []) or []:
+		_strip_from_nodes(mg.get("nodes", []))
+
+
+
 def cmd_blackboard_to_json(args: argparse.Namespace) -> None:
     """Read a BlackboardData asset and output clean JSON."""
     from .bb_json_converter import query_blackboard
@@ -6477,6 +6568,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_b2j.set_defaults(func=cmd_blueprint_to_json)
 
+    p_yaml_export = sub.add_parser(
+        "blueprint-to-yaml",
+        help="Export a Blueprint from UE as YAML with node anchors for readability.",
+        description=(
+            "Queries a Blueprint and outputs YAML with node anchors and connection\n"
+            "aliases, making the graph structure directly readable and editable.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli blueprint-to-yaml /Game/AI/Controller/AI_EnemyController\n"
+            "  soft-ue-cli blueprint-to-yaml /Game/AI/Controller/AI_EnemyController -o bp.yaml"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_yaml_export.add_argument("asset_path", help="Blueprint asset path")
+    p_yaml_export.add_argument("-o", "--output", metavar="FILE", help="Write YAML to file")
+    p_yaml_export.set_defaults(func=cmd_blueprint_to_yaml)
+
+    p_yaml_import = sub.add_parser(
+        "blueprint-from-yaml",
+        help="Create a Blueprint from a YAML file with node anchors.",
+        description=(
+            "Reads a YAML file (with node anchors), converts to JSON, and creates\n"
+            "a Blueprint via the bridge. Supports event_graph, function_graphs,\n"
+            "and macro_graphs.\n\n"
+            "EXAMPLES:\n"
+            "  soft-ue-cli blueprint-from-yaml bp.yaml\n"
+            "  soft-ue-cli blueprint-from-yaml bp.yaml --asset-path /Game/AI/Controller/BP_New"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p_yaml_import.add_argument("yaml_path", help="Path to the YAML file")
+    p_yaml_import.add_argument("--asset-path", metavar="PATH", help="Override asset path")
+    p_yaml_import.set_defaults(func=cmd_blueprint_from_yaml)
 
     # ── Blackboard commands ──────────────────────────────────────────────
 

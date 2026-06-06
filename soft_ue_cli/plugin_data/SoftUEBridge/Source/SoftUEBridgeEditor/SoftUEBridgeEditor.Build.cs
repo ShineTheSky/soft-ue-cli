@@ -71,8 +71,10 @@ public class SoftUEBridgeEditor : ModuleRules
 			"EnhancedInput",
 			"AIModule",
 
-			// Project Settings
+			// Project Settings / GAS
 			"GameplayTags",
+			"GameplayAbilities",
+			"GameplayTasks",
 			"EngineSettings",
 			"Projects",
 

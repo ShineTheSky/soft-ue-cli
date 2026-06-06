@@ -73,6 +73,26 @@ private:
 		const TSharedPtr<FJsonObject>& Props,
 		TArray<FString>& OutWarnings);
 
+	/** Restore pin types that AllocateDefaultPins cannot infer from serialized graph data. */
+	static void ApplyPromotablePinTypes(
+		UEdGraphNode* Node,
+		const TSharedPtr<FJsonObject>& NodeJson);
+
+	/** Apply serialized pin literal/object defaults to a node. */
+	static void ApplySerializedPinDefaults(
+		UEdGraphNode* Node,
+		const TSharedPtr<FJsonObject>& NodeJson,
+		const UEdGraphSchema* Schema,
+		bool bCoerceClassPinObjects);
+
+	/** Connect serialized node.pin references within a graph. */
+	static void ConnectSerializedPins(
+		const TArray<TSharedPtr<FJsonValue>>* Connections,
+		const TMap<FString, UEdGraphNode*>& IdToNode,
+		const UEdGraphSchema* Schema,
+		TArray<FString>& OutWarnings,
+		bool bWarnOnMalformed);
+
 	/** Find a pin on a node by name (case-insensitive). */
 	static UEdGraphPin* FindPin(UEdGraphNode* Node, const FString& PinName);
 };

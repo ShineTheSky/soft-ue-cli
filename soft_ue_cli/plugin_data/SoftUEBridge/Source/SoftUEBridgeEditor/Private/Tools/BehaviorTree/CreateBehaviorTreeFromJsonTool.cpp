@@ -424,6 +424,7 @@ FBridgeToolResult UCreateBehaviorTreeFromJsonTool::Execute(
 
 	UBehaviorTree* BT = LoadObject<UBehaviorTree>(nullptr, *AssetPath);
 	TArray<FString> Warnings;
+	UBlackboardData* Blackboard = nullptr;
 
 	// Resolve blackboard by short name via AssetRegistry when no full path given
 	if (BlackboardPath.IsEmpty())
@@ -447,6 +448,15 @@ FBridgeToolResult UCreateBehaviorTreeFromJsonTool::Execute(
 		}
 	}
 
+	if (!BlackboardPath.IsEmpty())
+	{
+		Blackboard = LoadObject<UBlackboardData>(nullptr, *BlackboardPath);
+		if (!Blackboard)
+		{
+			return FBridgeToolResult::Error(FString::Printf(TEXT("Blackboard not found: %s"), *BlackboardPath));
+		}
+	}
+
 	if (BT)
 	{
 		// Existing asset: clear old graph nodes before rebuilding
@@ -466,11 +476,9 @@ FBridgeToolResult UCreateBehaviorTreeFromJsonTool::Execute(
 
 	// Link BlackboardData — this is a reference to an EXTERNAL asset (unlike
 	// blueprints where variables are compiled into the class itself)
-	if (!BlackboardPath.IsEmpty())
+	if (Blackboard)
 	{
-		UBlackboardData* BB = LoadObject<UBlackboardData>(nullptr, *BlackboardPath);
-		if (BB) BT->BlackboardAsset = BB;
-		else Warnings.Add(FString::Printf(TEXT("Blackboard not found: %s"), *BlackboardPath));
+		BT->BlackboardAsset = Blackboard;
 	}
 
 	// ScopedTransaction wraps the entire graph build in a single undo step
@@ -493,6 +501,12 @@ FBridgeToolResult UCreateBehaviorTreeFromJsonTool::Execute(
 	RootNode->AllocateDefaultPins();
 	Graph->AddNode(RootNode, false, false);
 	RootNode->PostPlacedNewNode();
+	if (Blackboard)
+	{
+		RootNode->BlackboardAsset = Blackboard;
+		BT->BlackboardAsset = Blackboard;
+		Graph->UpdateBlackboardChange();
+	}
 
 	// Build the full tree recursively, collecting pin-links for later wiring
 	TArray<FParentChildLink> Links;
