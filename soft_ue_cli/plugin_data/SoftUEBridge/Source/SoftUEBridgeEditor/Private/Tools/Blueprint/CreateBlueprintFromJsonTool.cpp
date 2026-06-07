@@ -1176,7 +1176,11 @@ if (Blueprint->SimpleConstructionScript)
 					if (!PropVal->TryGetObject(PropObjPtr)) continue;
 					const TSharedPtr<FJsonObject>& PropObj = *PropObjPtr;
 
-					FString PropName = PropObj->GetStringField(TEXT("name"));
+					FString PropName;
+					if (!PropObj->TryGetStringField(TEXT("path"), PropName))
+					{
+						PropObj->TryGetStringField(TEXT("name"), PropName);
+					}
 					FString DefaultValue;
 					if (!PropObj->TryGetStringField(TEXT("default_value"), DefaultValue))
 						PropObj->TryGetStringField(TEXT("value"), DefaultValue);

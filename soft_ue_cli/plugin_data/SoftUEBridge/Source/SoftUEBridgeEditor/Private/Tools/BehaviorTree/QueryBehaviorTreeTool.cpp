@@ -6,6 +6,7 @@
 #include "BehaviorTree/BehaviorTree.h"
 #include "BehaviorTree/BlackboardData.h"
 #include "BehaviorTree/Blackboard/BlackboardKeyType.h"
+#include "BehaviorTree/Blackboard/BlackboardKeyType_Enum.h"
 #include "BehaviorTree/BTCompositeNode.h"
 #include "BehaviorTree/BTTaskNode.h"
 #include "BehaviorTree/BTDecorator.h"
@@ -57,6 +58,16 @@ static FString CompositeTypeToString(UBehaviorTreeGraphNode_Composite* CompNode)
 	return ClassName;
 }
 
+static void SetClassFields(TSharedPtr<FJsonObject> Json, UClass* Cls)
+{
+	if (!Json.IsValid() || !Cls)
+	{
+		return;
+	}
+	Json->SetStringField(TEXT("class"), Cls->GetName());
+	Json->SetStringField(TEXT("class_path"), Cls->GetPathName());
+}
+
 static TSharedPtr<FJsonObject> PropertiesToJson(UObject* Instance)
 {
 	TSharedPtr<FJsonObject> Props = MakeShareable(new FJsonObject);
@@ -68,7 +79,12 @@ static TSharedPtr<FJsonObject> PropertiesToJson(UObject* Instance)
 	for (TFieldIterator<FProperty> It(Instance->GetClass()); It; ++It)
 	{
 		FProperty* Prop = *It;
-		if (!Prop || Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient))
+		if (!Prop || !Prop->HasAnyPropertyFlags(CPF_Edit)
+			|| Prop->HasAnyPropertyFlags(CPF_Transient | CPF_DuplicateTransient | CPF_Deprecated))
+		{
+			continue;
+		}
+		if (Prop->HasMetaData(TEXT("HideInDetailPanel")))
 		{
 			continue;
 		}
@@ -80,10 +96,10 @@ static TSharedPtr<FJsonObject> PropertiesToJson(UObject* Instance)
 			TEXT("bApplyDecoratorScope"), TEXT("bShowPropertyDetails"),
 			TEXT("bShowEventDetails"), TEXT("bIgnoreRestartSelf"),
 			TEXT("TickInterval"), TEXT("bCallTickOnSearchStart"),
-			TEXT("bRestartTimerOnEachActivation"),
+			TEXT("bRestartTimerOnEachActivation"), TEXT("CachedDescription"),
 		};
 		bool bSkip = PropName.StartsWith(TEXT("bIs")) || PropName.StartsWith(TEXT("Node"))
-			|| PropName.Contains(TEXT("Memory"));
+			|| PropName.Contains(TEXT("Memory")) || PropName.Contains(TEXT("CachedDescription"));
 		for (const FString& Skip : SkipProps)
 		{
 			if (PropName == Skip) { bSkip = true; break; }
@@ -119,7 +135,7 @@ static TSharedPtr<FJsonObject> BTTaskToJson(UBTTaskNode* Task, int32 Depth)
 
 	Json->SetNumberField(TEXT("depth"), Depth);
 	Json->SetStringField(TEXT("kind"), TEXT("Task"));
-	Json->SetStringField(TEXT("class"), Task->GetClass()->GetName());
+	SetClassFields(Json, Task->GetClass());
 	FString Desc = Task->GetNodeName();
 	if (Desc.IsEmpty()) Desc = Task->GetClass()->GetName();
 	Json->SetStringField(TEXT("description"), Desc);
@@ -156,7 +172,7 @@ static TSharedPtr<FJsonObject> BTCompositeToJson(UBTCompositeNode* Composite, in
 		{
 			if (!Svc) continue;
 			TSharedPtr<FJsonObject> SvcJson = MakeShareable(new FJsonObject);
-			SvcJson->SetStringField(TEXT("class"), Svc->GetClass()->GetName());
+			SetClassFields(SvcJson, Svc->GetClass());
 			SvcJson->SetStringField(TEXT("description"), Svc->GetNodeName());
 			SvcJson->SetObjectField(TEXT("properties"), PropertiesToJson(Svc));
 			Services.Add(MakeShareable(new FJsonValueObject(SvcJson)));
@@ -193,7 +209,7 @@ static TSharedPtr<FJsonObject> BTCompositeToJson(UBTCompositeNode* Composite, in
 				{
 					if (!Dec) continue;
 					TSharedPtr<FJsonObject> DecJson = MakeShareable(new FJsonObject);
-					DecJson->SetStringField(TEXT("class"), Dec->GetClass()->GetName());
+					SetClassFields(DecJson, Dec->GetClass());
 					DecJson->SetStringField(TEXT("description"), Dec->GetNodeName());
 					DecJson->SetObjectField(TEXT("properties"), PropertiesToJson(Dec));
 					FString FlowStr;
@@ -282,9 +298,9 @@ static TSharedPtr<FJsonObject> NodeToJson(UAIGraphNode* GraphNode, int32 Depth)
 			{
 				TSharedPtr<FJsonObject> Svc = MakeShareable(new FJsonObject);
 				Svc->SetStringField(TEXT("kind"), TEXT("Service"));
-				Svc->SetStringField(TEXT("class"), SvcNode->NodeInstance
-					? SvcNode->NodeInstance->GetClass()->GetName()
-					: SvcNode->GetClass()->GetName());
+				SetClassFields(Svc, SvcNode->NodeInstance
+					? SvcNode->NodeInstance->GetClass()
+					: SvcNode->GetClass());
 				Svc->SetStringField(TEXT("description"), SvcNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 				if (SvcNode->NodeInstance)
 				{
@@ -299,7 +315,7 @@ static TSharedPtr<FJsonObject> NodeToJson(UAIGraphNode* GraphNode, int32 Depth)
 				if (DecNode->NodeInstance && DecNode->NodeInstance->IsA<UBTService>())
 				{
 					TSharedPtr<FJsonObject> Svc = MakeShareable(new FJsonObject);
-					Svc->SetStringField(TEXT("class"), DecNode->NodeInstance->GetClass()->GetName());
+					SetClassFields(Svc, DecNode->NodeInstance->GetClass());
 					Svc->SetStringField(TEXT("description"), DecNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 					Svc->SetObjectField(TEXT("properties"), PropertiesToJson(DecNode->NodeInstance));
 					Services.Add(MakeShareable(new FJsonValueObject(Svc)));
@@ -307,9 +323,9 @@ static TSharedPtr<FJsonObject> NodeToJson(UAIGraphNode* GraphNode, int32 Depth)
 				else
 				{
 					TSharedPtr<FJsonObject> Dec = MakeShareable(new FJsonObject);
-					Dec->SetStringField(TEXT("class"), DecNode->NodeInstance
-						? DecNode->NodeInstance->GetClass()->GetName()
-						: DecNode->GetClass()->GetName());
+					SetClassFields(Dec, DecNode->NodeInstance
+						? DecNode->NodeInstance->GetClass()
+						: DecNode->GetClass());
 					Dec->SetStringField(TEXT("description"), DecNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 					if (DecNode->NodeInstance)
 					{
@@ -373,9 +389,9 @@ static TSharedPtr<FJsonObject> NodeToJson(UAIGraphNode* GraphNode, int32 Depth)
 	if (UBehaviorTreeGraphNode_Task* TaskNode = Cast<UBehaviorTreeGraphNode_Task>(GraphNode))
 	{
 		Json->SetStringField(TEXT("kind"), TEXT("Task"));
-		Json->SetStringField(TEXT("class"), TaskNode->NodeInstance
-			? TaskNode->NodeInstance->GetClass()->GetName()
-			: TaskNode->GetClass()->GetName());
+		SetClassFields(Json, TaskNode->NodeInstance
+			? TaskNode->NodeInstance->GetClass()
+			: TaskNode->GetClass());
 		Json->SetStringField(TEXT("description"), TaskNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 		if (TaskNode->NodeInstance)
 		{
@@ -391,7 +407,7 @@ static TSharedPtr<FJsonObject> NodeToJson(UAIGraphNode* GraphNode, int32 Depth)
 				if (DecNode->NodeInstance && !DecNode->NodeInstance->IsA<UBTService>())
 				{
 					TSharedPtr<FJsonObject> Dec = MakeShareable(new FJsonObject);
-					Dec->SetStringField(TEXT("class"), DecNode->NodeInstance->GetClass()->GetName());
+					SetClassFields(Dec, DecNode->NodeInstance->GetClass());
 					Dec->SetStringField(TEXT("description"), DecNode->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
 					Dec->SetObjectField(TEXT("properties"), PropertiesToJson(DecNode->NodeInstance));
 					Decorators.Add(MakeShareable(new FJsonValueObject(Dec)));
@@ -431,6 +447,17 @@ static TSharedPtr<FJsonObject> BlackboardToJson(UBlackboardData* BB)
 		if (Entry.KeyType)
 		{
 			KeyObj->SetStringField(TEXT("type"), Entry.KeyType->GetClass()->GetName());
+			if (UBlackboardKeyType_Enum* EnumKey = Cast<UBlackboardKeyType_Enum>(Entry.KeyType))
+			{
+				if (EnumKey->EnumType)
+				{
+					KeyObj->SetStringField(TEXT("enum_path"), EnumKey->EnumType->GetPathName());
+				}
+				if (!EnumKey->EnumName.IsEmpty())
+				{
+					KeyObj->SetStringField(TEXT("enum_name"), EnumKey->EnumName);
+				}
+			}
 			KeyObj->SetBoolField(TEXT("is_instance_editable"), Entry.KeyType->HasAnyFlags(RF_NeedPostLoad)); // rough
 		}
 		Keys.Add(MakeShareable(new FJsonValueObject(KeyObj)));

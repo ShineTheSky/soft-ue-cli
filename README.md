@@ -82,7 +82,7 @@ The two can coexist: use UE's first-party MCP for native UE 5.8 editor coverage 
 
 ---
 
-## Why This Fork? · ShineTheSky · v1.34.0-fork.1
+## Why This Fork? · ShineTheSky · v1.34.0-fork.2
 
 **Goal:** losslessly convert Blueprint and Behavior Tree assets into structured JSON and DSL formats, enabling LLM agents to batch-read, analyze, diff, and author UE gameplay logic without opening the editor.
 
@@ -90,16 +90,17 @@ This fork extends soft-ue-cli with authoring, introspection, and serialization t
 
 - **ModifyEnumTool** — add, remove, or rename enumerators in UserDefinedEnum assets.
 - **CreateBlueprintFromJsonTool** — create Blueprints from JSON, building both the EventGraph (Events, CallFunction, Variable Get/Set, Branch, Sequence, DynamicCast, Timeline, BreakStruct, etc.) and the SCS component tree with component property initialization.
-- **CreateBehaviorTreeFromJsonTool** — create Behavior Trees from JSON; paired with `bt_dsl_compiler` which compiles a human-readable indented-text DSL (.bttxt) into BT JSON.
-- **QueryBehaviorTreeTool** — query Behavior Tree assets: blackboard keys, composite tree structure, decorators, services, and per-node UPROPERTY values.
-- **Enhanced QueryBlueprintGraphTool** — full K2Node query support (Event, CustomEvent, CallFunction, FunctionEntry/Result, Variable Get/Set, DynamicCast, Branch, Sequence, MacroInstance, Timeline, BreakStruct, MakeArray, Tunnel, ComponentBoundEvent, PromotableOperator, BaseAsyncTask, Message) plus Animation Blueprint graph support.
-- **Enhanced QueryBlueprintTool** — component introspection and function override discovery.
+- **CreateBehaviorTreeFromJsonTool** — create Behavior Trees from JSON; paired with `bt_dsl_compiler` which compiles a human-readable indented-text DSL (.bttxt / .bttxtv2) into BT JSON with enum round-trip support.
+- **QueryBehaviorTreeTool** — query Behavior Tree assets: blackboard keys (including enum type paths), composite tree structure, decorators, services, per-node UPROPERTY values, and `class_path` metadata.
+- **Enhanced QueryBlueprintGraphTool** — full K2Node query support (Event, CustomEvent, CallFunction, FunctionEntry/Result, Variable Get/Set, DynamicCast, Branch, Sequence, MacroInstance, Timeline, BreakStruct, MakeArray, Tunnel, ComponentBoundEvent, PromotableOperator, BaseAsyncTask, Message) plus Animation Blueprint and function/macro graph support.
+- **Enhanced QueryBlueprintTool** — component introspection, function override discovery, and enriched CDO property metadata (category, display_name, owner_class, source_hint).
+- **Blueprint YAML pipeline** — `blueprint-to-yaml` and `blueprint-from-yaml` commands with ruamel.yaml anchors for readable, diff-friendly graph representation, plus CDO metadata annotations as grouped YAML comments.
 - **Python tools:**
   - `blueprint_json.py` — validate Blueprint JSON structure and route to bridge for creation.
-  - `bp_json_converter.py` — convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create); supports event_graph, function_graphs, and macro_graphs.
-  - `bp_yaml_converter.py` — YAML anchor/alias pipeline for readable, diff-friendly Blueprint graph representation (round-trip: YAML ↔ JSON → Bridge).
-  - `bt_dsl_compiler.py` — compile indented-text DSL (.bttxt) to/from Behavior Tree JSON.
-  - `bb_json_converter.py` — BlackboardData JSON round-trip (parse/export blackboard key definitions).
+  - `bp_json_converter.py` — convert query-blueprint + query-blueprint-graph output into create-blueprint-from-json input (round-trip: query → create); supports event_graph, function_graphs, and macro_graphs with enriched CDO metadata.
+  - `bp_yaml_converter.py` — YAML anchor/alias pipeline for readable, diff-friendly Blueprint graph round-trip with CDO metadata comment annotations.
+  - `bt_dsl_compiler.py` — compile indented-text DSL (.bttxtv2) to/from Behavior Tree JSON with enum internal value restoration, `properties:` blocks, and explicit `FlowControl:` lines.
+  - `bb_json_converter.py` — BlackboardData JSON round-trip (parse/export blackboard key definitions with enum type support).
 
 All upstream features and commands are preserved. This fork tracks upstream releases and layers its own tools on top. See [CHANGELOG.md](CHANGELOG.md) for details.
 

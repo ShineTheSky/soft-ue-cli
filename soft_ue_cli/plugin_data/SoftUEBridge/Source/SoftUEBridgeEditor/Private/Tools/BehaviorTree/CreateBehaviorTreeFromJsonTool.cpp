@@ -45,6 +45,12 @@ static UClass* FindCompositeClass(const FString& TypeName)
 // blueprint-generated classes use _C suffixes.
 static UClass* FindBTClass(const FString& ClassName, UClass* BaseClass)
 {
+	if (ClassName.StartsWith(TEXT("/")))
+	{
+		if (UClass* Cls = LoadClass<UObject>(nullptr, *ClassName))
+			if (Cls->IsChildOf(BaseClass)) return Cls;
+	}
+
 	// Exact match against the global UClass registry
 	if (UClass* Cls = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::ExactClass))
 		if (Cls->IsChildOf(BaseClass)) return Cls;
@@ -176,6 +182,8 @@ static UBehaviorTreeGraphNode* CreateBTNode(
 	int32 ParentY = 0)
 {
 	FString Kind = NodeJson->GetStringField(TEXT("kind"));
+	UBehaviorTree* BTAsset = Graph ? Cast<UBehaviorTree>(Graph->GetOuter()) : nullptr;
+	UObject* NodeInstanceOuter = BTAsset ? static_cast<UObject*>(BTAsset) : static_cast<UObject*>(Graph);
 
 	if (Kind == TEXT("Composite") || Kind == TEXT("Root"))
 	{
@@ -196,7 +204,7 @@ static UBehaviorTreeGraphNode* CreateBTNode(
 
 		// Create the runtime composite instance that holds gameplay logic
 		UBTCompositeNode* CompositeInstance = NewObject<UBTCompositeNode>(
-			CompNode, CompClass, NAME_None, RF_Transactional);
+			NodeInstanceOuter, CompClass, NAME_None, RF_Transactional);
 		CompNode->NodeInstance = CompositeInstance;
 
 		// Properties before AllocateDefaultPins — some composites use them for pin config
@@ -204,6 +212,7 @@ static UBehaviorTreeGraphNode* CreateBTNode(
 		if (NodeJson->TryGetObjectField(TEXT("properties"), Props))
 			SetObjectProperties(CompositeInstance, *Props);
 
+		CompNode->InitializeInstance();
 		CompNode->AllocateDefaultPins();
 		Graph->AddNode(CompNode, false, false);
 		CompNode->PostPlacedNewNode();
@@ -229,11 +238,12 @@ static UBehaviorTreeGraphNode* CreateBTNode(
 							Graph, UBehaviorTreeGraphNode_Service::StaticClass(), NAME_None, RF_Transactional);
 						SvcNode->CreateNewGuid();
 						SvcNode->bIsSubNode = true;
-						UBTService* SvcInst = NewObject<UBTService>(SvcNode, SvcType, NAME_None, RF_Transactional);
+						UBTService* SvcInst = NewObject<UBTService>(NodeInstanceOuter, SvcType, NAME_None, RF_Transactional);
 						const TSharedPtr<FJsonObject>* SvcProps = nullptr;
 						if ((*SvcObj)->TryGetObjectField(TEXT("properties"), SvcProps))
 							SetObjectProperties(SvcInst, *SvcProps);
 						SvcNode->NodeInstance = SvcInst;
+						SvcNode->InitializeInstance();
 						SvcNode->AllocateDefaultPins();
 						SvcNode->PostPlacedNewNode();
 						SvcNode->ParentNode = CompNode;
@@ -266,11 +276,12 @@ static UBehaviorTreeGraphNode* CreateBTNode(
 							Graph, UBehaviorTreeGraphNode_Decorator::StaticClass(), NAME_None, RF_Transactional);
 						DecNode->CreateNewGuid();
 						DecNode->bIsSubNode = true;
-						UBTDecorator* DecInst = NewObject<UBTDecorator>(DecNode, DecType, NAME_None, RF_Transactional);
+						UBTDecorator* DecInst = NewObject<UBTDecorator>(NodeInstanceOuter, DecType, NAME_None, RF_Transactional);
 						const TSharedPtr<FJsonObject>* DecProps = nullptr;
 						if ((*DecObj)->TryGetObjectField(TEXT("properties"), DecProps))
 							SetObjectProperties(DecInst, *DecProps);
 						DecNode->NodeInstance = DecInst;
+						DecNode->InitializeInstance();
 						DecNode->AllocateDefaultPins();
 						DecNode->PostPlacedNewNode();
 						CompNode->SubNodes.Add(DecNode);
@@ -327,13 +338,14 @@ static UBehaviorTreeGraphNode* CreateBTNode(
 		TaskNode->CreateNewGuid();
 
 		// Create the runtime task instance that executes gameplay behavior
-		UBTTaskNode* TaskInst = NewObject<UBTTaskNode>(TaskNode, TaskType, NAME_None, RF_Transactional);
+		UBTTaskNode* TaskInst = NewObject<UBTTaskNode>(NodeInstanceOuter, TaskType, NAME_None, RF_Transactional);
 		TaskNode->NodeInstance = TaskInst;
 
 		const TSharedPtr<FJsonObject>* Props = nullptr;
 		if (NodeJson->TryGetObjectField(TEXT("properties"), Props))
 			SetObjectProperties(TaskInst, *Props);
 
+		TaskNode->InitializeInstance();
 		TaskNode->AllocateDefaultPins();
 		Graph->AddNode(TaskNode, false, false);
 		TaskNode->PostPlacedNewNode();
@@ -357,11 +369,12 @@ static UBehaviorTreeGraphNode* CreateBTNode(
 							Graph, UBehaviorTreeGraphNode_Decorator::StaticClass(), NAME_None, RF_Transactional);
 						DecNode->CreateNewGuid();
 						DecNode->bIsSubNode = true;
-						UBTDecorator* DI = NewObject<UBTDecorator>(DecNode, DecType, NAME_None, RF_Transactional);
+						UBTDecorator* DI = NewObject<UBTDecorator>(NodeInstanceOuter, DecType, NAME_None, RF_Transactional);
 						const TSharedPtr<FJsonObject>* DecProps = nullptr;
 						if ((*DecObj)->TryGetObjectField(TEXT("properties"), DecProps))
 							SetObjectProperties(DI, *DecProps);
 						DecNode->NodeInstance = DI;
+						DecNode->InitializeInstance();
 						DecNode->AllocateDefaultPins();
 						DecNode->PostPlacedNewNode();
 						TaskNode->SubNodes.Add(DecNode);

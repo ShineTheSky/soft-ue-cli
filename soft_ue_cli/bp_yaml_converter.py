@@ -48,6 +48,7 @@ def json_to_yaml(blueprint_json: dict[str, Any]) -> str:
 
     # Replace connections: flat strings → anchored references
     _convert_connections_to_yaml(data)
+    _annotate_cdo_defaults(data)
 
     yaml = YAML()
     yaml.indent(mapping=2, sequence=4, offset=2)
@@ -57,6 +58,42 @@ def json_to_yaml(blueprint_json: dict[str, Any]) -> str:
     buf = io.StringIO()
     yaml.dump(data, buf)
     return buf.getvalue()
+
+
+def _annotate_cdo_defaults(data: CommentedMap) -> None:
+    """Render CDO category/display/source metadata as YAML comments."""
+    defaults = data.get("defaults")
+    if not isinstance(defaults, CommentedMap):
+        return
+    props = defaults.get("properties")
+    if not isinstance(props, CommentedSeq):
+        return
+
+    last_category = None
+    last_owner = None
+    for idx, prop in enumerate(props):
+        if not isinstance(prop, CommentedMap):
+            continue
+        category = str(prop.pop("category", "") or "Default")
+        display_name = str(prop.pop("display_name", "") or "")
+        owner_class = str(prop.pop("owner_class", "") or "")
+        source_hint = str(prop.pop("source_hint", "") or "")
+
+        before_lines: list[str] = []
+        if category != last_category:
+            before_lines.append(f"## CDO / {category}")
+            last_category = category
+            last_owner = None
+        if owner_class and owner_class != last_owner:
+            before_lines.append(f"@owner {owner_class}")
+            last_owner = owner_class
+        if display_name:
+            before_lines.append(f"@display {display_name}")
+        if source_hint:
+            before_lines.append(f"@see {source_hint}")
+
+        if before_lines:
+            props.yaml_set_comment_before_after_key(idx, before="\n".join(before_lines))
 
 
 def _anchor_name(graph_name: str, node_id: str) -> str:
@@ -150,8 +187,27 @@ def yaml_to_json(yaml_text: str) -> dict[str, Any]:
 
     # Convert connections back to flat strings
     _convert_connections_to_json(data, node_guid_map)
+    _normalize_defaults_for_bridge(data)
 
     return data
+
+
+def _normalize_defaults_for_bridge(data: dict[str, Any]) -> None:
+    """Convert human-facing CDO YAML fields back to bridge JSON fields."""
+    defaults = data.get("defaults")
+    if not isinstance(defaults, dict):
+        return
+    props = defaults.get("properties")
+    if not isinstance(props, list):
+        return
+    for prop in props:
+        if not isinstance(prop, dict):
+            continue
+        path = prop.get("path")
+        if path and not prop.get("name"):
+            prop["name"] = path
+        for meta_key in ("path", "category", "display_name", "owner_class", "source_hint"):
+            prop.pop(meta_key, None)
 
 
 def _index_nodes_by_object(nodes: list[Any], obj_map: dict[int, str]) -> None:

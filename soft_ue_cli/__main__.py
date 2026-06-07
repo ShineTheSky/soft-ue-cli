@@ -1285,7 +1285,7 @@ def cmd_create_blackboard_from_json(args: argparse.Namespace) -> None:
 
     json_path = getattr(args, "json_path", "")
     try:
-        with open(json_path, "r", encoding="utf-8") as f:
+        with open(json_path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -1328,10 +1328,12 @@ def cmd_behavior_tree_to_text(args: argparse.Namespace) -> None:
     from .bt_dsl_compiler import decompile_bt_json_to_text
 
     data = _run_tool("query-behaviortree", {"asset_path": args.asset_path})
+    _attach_enum_entries_to_behavior_tree_payload(data)
     from datetime import datetime
     bb = data.get("blackboard", {})
     header = (
         f"---\n"
+        f"format: bttxtv2\n"
         f"name: {data.get('name', args.asset_path)}\n"
         f"type: BehaviorTree\n"
         f"asset: {data.get('path', args.asset_path)}\n"
@@ -1351,14 +1353,24 @@ def cmd_behavior_tree_to_text(args: argparse.Namespace) -> None:
 
 def cmd_create_behavior_tree_from_text(args: argparse.Namespace) -> None:
     """Read .bttxt file, compile to JSON, create BehaviorTree via UE bridge."""
-    from .bt_dsl_compiler import compile_bt_file, BTParseError
+    from .bt_dsl_compiler import compile_bt_file, BTParseError, _restore_enum_internal_values
 
     bt_path = getattr(args, "bt_path", "")
     asset_path = getattr(args, "asset_path", None)
+    blackboard_sync = getattr(args, "blackboard_sync", "error")
+    if getattr(args, "no_blackboard_sync", False):
+        blackboard_sync = "off"
 
     try:
         payload = compile_bt_file(bt_path)
     except (FileNotFoundError, BTParseError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        _attach_enum_entries_to_behavior_tree_payload(payload)
+        _restore_enum_internal_values(payload)
+    except (BTParseError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)
 
@@ -1367,7 +1379,253 @@ def cmd_create_behavior_tree_from_text(args: argparse.Namespace) -> None:
     elif "name" in payload and "asset_path" not in payload:
         payload["asset_path"] = f"/Game/AI/{payload['name']}"
 
+    if blackboard_sync != "off":
+        try:
+            _sync_blackboard_for_behavior_tree_payload(payload, blackboard_sync)
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     _print_json(_run_tool("create-behaviortree-from-json", payload))
+
+
+def _attach_enum_entries_to_behavior_tree_payload(payload: dict[str, object]) -> None:
+    blackboard = payload.get("blackboard")
+    if not isinstance(blackboard, dict):
+        keys = payload.get("blackboard_keys")
+        if isinstance(keys, list):
+            blackboard = {"keys": keys}
+        else:
+            return
+
+    keys = blackboard.get("keys")
+    if not isinstance(keys, list):
+        return
+
+    enum_cache: dict[str, list[dict[str, object]]] = {}
+    for key in keys:
+        if not isinstance(key, dict):
+            continue
+        key_type = str(key.get("type", "")).replace("BlackboardKeyType_", "")
+        if key_type.lower() != "enum":
+            continue
+        enum_path = str(key.get("enum_path") or key.get("enum_type") or key.get("enum") or "")
+        if not enum_path:
+            continue
+        if enum_path not in enum_cache:
+            try:
+                enum_data = _run_tool("query-enum", {"asset_path": enum_path})
+            except Exception:
+                enum_cache[enum_path] = []
+            else:
+                entries = enum_data.get("enumerators", []) if isinstance(enum_data, dict) else []
+                enum_cache[enum_path] = [entry for entry in entries if isinstance(entry, dict)]
+        if enum_cache[enum_path] and key.get("enum_entries"):
+            _validate_declared_enum_entries(key, enum_cache[enum_path], enum_path)
+        elif enum_cache[enum_path]:
+            key["enum_entries"] = enum_cache[enum_path]
+
+    if "blackboard_keys" in payload and isinstance(payload["blackboard_keys"], list):
+        by_name = {str(key.get("name", "")): key for key in keys if isinstance(key, dict)}
+        for key in payload["blackboard_keys"]:
+            if not isinstance(key, dict):
+                continue
+            enriched = by_name.get(str(key.get("name", "")))
+            if enriched and enriched.get("enum_entries"):
+                key["enum_entries"] = enriched["enum_entries"]
+
+
+def _enum_entry_identity(entry: dict[str, object]) -> tuple[str, str]:
+    internal = str(entry.get("internal_name") or "")
+    display = str(entry.get("display_name") or entry.get("authored_name") or "")
+    return internal, display
+
+
+def _validate_declared_enum_entries(
+    key: dict[str, object],
+    asset_entries: list[dict[str, object]],
+    enum_path: str,
+) -> None:
+    declared_entries = key.get("enum_entries") or []
+    if not isinstance(declared_entries, list):
+        return
+
+    asset_by_internal = {
+        internal: display
+        for internal, display in (_enum_entry_identity(entry) for entry in asset_entries)
+        if internal
+    }
+    declared_by_internal = {
+        internal: display
+        for internal, display in (_enum_entry_identity(entry) for entry in declared_entries if isinstance(entry, dict))
+        if internal
+    }
+
+    mismatches: list[str] = []
+    for internal, declared_display in declared_by_internal.items():
+        asset_display = asset_by_internal.get(internal)
+        if asset_display is None:
+            mismatches.append(f"{internal}:{declared_display} is not in asset")
+        elif asset_display != declared_display:
+            mismatches.append(f"{internal}: bttxt={declared_display}, asset={asset_display}")
+
+    missing = sorted(set(asset_by_internal) - set(declared_by_internal))
+    if missing:
+        mismatches.append("missing asset entries: " + ", ".join(f"{name}:{asset_by_internal[name]}" for name in missing))
+
+    if mismatches:
+        key_name = str(key.get("name") or "<unknown>")
+        raise RuntimeError(
+            f"Enum mapping mismatch for blackboard key '{key_name}' ({enum_path}): "
+            + "; ".join(mismatches)
+        )
+
+
+def _asset_object_path_to_package_path(path: str) -> str:
+    if not path:
+        return path
+    if "." in path and not path.startswith("/Script/"):
+        package_path, object_name = path.rsplit(".", 1)
+        if package_path.rsplit("/", 1)[-1] == object_name:
+            return package_path
+    return path
+
+
+def _key_identity(key: dict[str, object]) -> str:
+    return str(key.get("name", ""))
+
+
+def _ue_asset_exists(asset_path: str) -> bool:
+    script = (
+        "import unreal\n"
+        f"asset = unreal.load_asset({asset_path!r})\n"
+        "print('__ASSET_EXISTS__' + ('1' if asset else '0'))\n"
+    )
+    result = _run_tool("run-python-script", {"script": script})
+    output = result.get("output", "") if isinstance(result, dict) else ""
+    return "__ASSET_EXISTS__1" in output
+
+
+def _blackboard_type_name(key: dict[str, object]) -> str:
+    key_type = str(key.get("type", ""))
+    return key_type.replace("BlackboardKeyType_", "")
+
+
+def _blackboard_key_changed(existing: dict[str, object], declared: dict[str, object]) -> bool:
+    if _blackboard_type_name(existing) != _blackboard_type_name(declared):
+        return True
+    if _blackboard_type_name(declared).lower() == "enum":
+        return str(existing.get("enum_path", "")) != str(declared.get("enum_path", ""))
+    return False
+
+
+def _format_key_list(keys: list[dict[str, object]]) -> str:
+    return ", ".join(str(key.get("name", "")) for key in keys if key.get("name"))
+
+
+def _sync_blackboard_for_behavior_tree_payload(payload: dict[str, object], mode: str) -> None:
+    keys = payload.get("blackboard_keys") or []
+    if not keys:
+        return
+
+    blackboard_path = str(payload.get("blackboard_path") or "")
+    if not blackboard_path:
+        blackboard_name = str(payload.get("blackboard_name") or "")
+        if not blackboard_name:
+            return
+        blackboard_path = f"/Game/AI/Blackboard/{blackboard_name}"
+
+    target_path = _asset_object_path_to_package_path(blackboard_path)
+
+    from .bb_json_converter import query_blackboard, build_create_script
+
+    existing: dict[str, object] | None = query_blackboard(target_path) if _ue_asset_exists(target_path) else None
+
+    declared_keys = [dict(key) for key in keys if isinstance(key, dict) and _key_identity(key)]
+
+    if existing is None:
+        if mode not in ("create", "merge"):
+            raise RuntimeError(
+                f"Blackboard {target_path} does not exist. "
+                "Re-run with --blackboard-sync create to create it from bttxt keys, "
+                "or --blackboard-sync merge to allow create/update."
+            )
+    else:
+        existing_by_name = {
+            _key_identity(dict(key)): dict(key)
+            for key in existing.get("keys", [])
+            if isinstance(key, dict) and _key_identity(key)
+        }
+        missing = [key for key in declared_keys if _key_identity(key) not in existing_by_name]
+        changed = [
+            key
+            for key in declared_keys
+            if _key_identity(key) in existing_by_name
+            and _blackboard_key_changed(existing_by_name[_key_identity(key)], key)
+        ]
+        if (missing or changed) and mode != "merge":
+            details: list[str] = []
+            if missing:
+                details.append(f"missing keys: {_format_key_list(missing)}")
+            if changed:
+                details.append(f"type/path differs for keys: {_format_key_list(changed)}")
+            raise RuntimeError(
+                f"Blackboard {target_path} is not in sync with bttxt ({'; '.join(details)}). "
+                "Re-run with --blackboard-sync merge to add/update keys declared in the bttxt."
+            )
+        if not missing and not changed:
+            payload["blackboard_path"] = target_path
+            return
+        if mode == "create":
+            raise RuntimeError(
+                f"Blackboard {target_path} already exists and needs updates. "
+                "Use --blackboard-sync merge to update existing keys."
+            )
+
+    merged_keys: list[dict[str, object]] = []
+    by_name: dict[str, dict[str, object]] = {}
+    if existing:
+        for key in existing.get("keys", []):
+            if isinstance(key, dict) and _key_identity(key):
+                key_copy = dict(key)
+                by_name[_key_identity(key_copy)] = key_copy
+                merged_keys.append(key_copy)
+
+    for key in keys:
+        if not isinstance(key, dict) or not _key_identity(key):
+            continue
+        key_copy = dict(key)
+        name = _key_identity(key_copy)
+        if name in by_name:
+            by_name[name].clear()
+            by_name[name].update(key_copy)
+        else:
+            by_name[name] = key_copy
+            merged_keys.append(key_copy)
+
+    blackboard_json: dict[str, object] = {
+        "asset_path": target_path,
+        "path": target_path,
+        "parent_class": "BlackboardData",
+        "parent": existing.get("parent") if existing else None,
+        "keys": merged_keys,
+    }
+
+    if existing is None:
+        create_result = _run_tool("create-asset", {
+            "asset_path": target_path,
+            "asset_class": "BlackboardData",
+        })
+        if not create_result.get("success"):
+            message = create_result.get("error", create_result)
+            raise RuntimeError(f"Failed to create Blackboard {target_path}: {message}")
+
+    script = build_create_script(blackboard_json, asset_path=target_path)
+    py_result = _run_tool("run-python-script", {"script": script})
+    if not py_result.get("success"):
+        raise RuntimeError(f"Blackboard sync failed for {target_path}: {py_result.get('error', 'unknown')}")
+
+    payload["blackboard_path"] = target_path
 
 
 def cmd_validate_bt_text(args: argparse.Namespace) -> None:
@@ -6705,6 +6963,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_cbtt.add_argument(
         "--asset-path", metavar="PATH",
         help="Override the asset path. Defaults to /Game/AI/<name>.",
+    )
+    p_cbtt.add_argument(
+        "--blackboard-sync",
+        choices=("error", "create", "merge", "off"),
+        default="error",
+        help=(
+            "Blackboard handling for keys declared in bttxt: "
+            "error=check only, create=create missing BB, merge=create/update keys, off=skip."
+        ),
+    )
+    p_cbtt.add_argument(
+        "--no-blackboard-sync", action="store_true",
+        help="Deprecated alias for --blackboard-sync off.",
     )
     p_cbtt.set_defaults(func=cmd_create_behavior_tree_from_text)
 

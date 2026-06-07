@@ -2,6 +2,26 @@
 
 All notable changes to soft-ue-cli will be documented in this file.
 
+## [Fork · ShineTheSky · v1.34.0-fork.2]
+
+### Added
+- **BT DSL v2 format (bttxtv2)** -- upgraded `bt_dsl_compiler` with `properties:` blocks, explicit `FlowControl:` lines, tab indentation, and `# @summary`/`# @intent` comment hints ignored by the compiler.
+- **Enum round-trip for Behavior Trees** -- attach enum entries from UE assets during BT query, validate declared entries against the asset when compiling, and restore internal enum values (`NewEnumerator0`, etc.) in created BT nodes.
+- **Blackboard sync during BT creation** -- `--blackboard-sync` (default: error) and `--no-blackboard-sync` flags control whether the BT blackboard is synced with the linked BlackboardData asset on creation.
+- **CDO property metadata** -- query and YAML output now include `path`, `category`, `display_name`, `owner_class`, and `source_hint` for each CDO default property.
+- **YAML CDO annotations** -- `bp_yaml_converter` renders CDO category/owner/display/source metadata as grouped YAML comments and normalizes them back for bridge JSON round-trip.
+- **`class_path` in BT/BP query output** -- C++ tools now output both `class` and `class_path` for every node, service, decorator, and task.
+- **Asset-path class loading** -- `CreateBehaviorTreeFromJsonTool` supports `/Game/...` class paths via `LoadClass` for BT tasks, decorators, and services.
+- **Enum key type in Blackboard query** -- `QueryBehaviorTreeTool` now outputs `enum_path` and `enum_name` for `BlackboardKeyType_Enum` keys.
+
+### Fixed
+- **BT node instance Outer** -- runtime BT node instances (composites, tasks, decorators, services) now use the BT asset as their Outer instead of the graph node, preventing potential GC issues.
+- **Missing InitializeInstance calls** -- `CreateBehaviorTreeFromJsonTool` now calls `InitializeInstance()` after creating every BT node, service, decorator, and task instance.
+- **BT/BP property output noise** -- C++ query tools now filter out non-`CPF_Edit`, deprecated, hidden (`HideInDetailPanel`, `Hidden`, `BlueprintInternalUseOnly`), and transient properties, and skip `CachedDescription` noise.
+- **Blackboard query reliability** -- `bb_json_converter` now uses Python script execution inside UE instead of parsing asset export text, correctly extracting enum type paths and names.
+- **BOM encoding** -- JSON files are now read with `utf-8-sig` encoding to handle BOM headers.
+- **CDO property path consistency** -- both Python converters and C++ `CreateBlueprintFromJsonTool` now try `path` before `name` for CDO property lookup, matching the enriched query output.
+
 ## [Fork · ShineTheSky · v1.34.0-fork.1]
 
 ### Added

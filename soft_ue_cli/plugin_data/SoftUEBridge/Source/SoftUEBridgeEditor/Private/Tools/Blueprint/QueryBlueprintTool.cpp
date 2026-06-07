@@ -516,6 +516,22 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::ExtractDefaults(UBlueprint* Bluepri
 			continue;
 		}
 
+		if (!Property->HasAnyPropertyFlags(CPF_Edit) ||
+			Property->HasAnyPropertyFlags(
+				CPF_Transient |
+				CPF_DuplicateTransient |
+				CPF_NonPIEDuplicateTransient |
+				CPF_Deprecated |
+				CPF_EditConst |
+				CPF_TextExportTransient |
+				CPF_SkipSerialization) ||
+			Property->HasMetaData(TEXT("Hidden")) ||
+			Property->HasMetaData(TEXT("HideInDetailPanel")) ||
+			Property->HasMetaData(TEXT("BlueprintInternalUseOnly")))
+		{
+			continue;
+		}
+
 		// Apply property name filter
 		if (!PropertyFilter.IsEmpty())
 		{
@@ -568,6 +584,13 @@ TSharedPtr<FJsonObject> UQueryBlueprintTool::PropertyToJson(FProperty* Property,
 	// Basic info
 	PropertyJson->SetStringField(TEXT("name"), Property->GetName());
 	PropertyJson->SetStringField(TEXT("type"), GetPropertyTypeString(Property));
+	PropertyJson->SetStringField(TEXT("display_name"), Property->GetDisplayNameText().ToString());
+
+	if (UClass* OwnerClass = Property->GetOwnerClass())
+	{
+		PropertyJson->SetStringField(TEXT("owner_class"), OwnerClass->GetPathName());
+		PropertyJson->SetStringField(TEXT("source_hint"), FString::Printf(TEXT("%s%s::%s"), OwnerClass->GetPrefixCPP(), *OwnerClass->GetName(), *Property->GetName()));
+	}
 
 	// Category
 	FString Category = Property->GetMetaData(TEXT("Category"));

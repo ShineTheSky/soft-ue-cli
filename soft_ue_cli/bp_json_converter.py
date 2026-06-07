@@ -108,7 +108,7 @@ def convert_to_create_json(
         })
         meaningful = []
         for p in bp_defaults:
-            name = p.get("name", "")
+            name = p.get("path") or p.get("name", "")
             if name in _RUNTIME:
                 continue
             dv = p.get("default_value", "")
@@ -116,7 +116,11 @@ def convert_to_create_json(
                        '(TagName="")', "ReplicateNo", "InstancedPerExecution",
                        "LocalPredicted", "ClientOrServer"):
                 continue
-            meaningful.append({"name": name, "default_value": dv})
+            entry = {"path": name, "default_value": dv}
+            for meta_key in ("category", "display_name", "owner_class", "source_hint"):
+                if p.get(meta_key):
+                    entry[meta_key] = p[meta_key]
+            meaningful.append(entry)
         if meaningful:
             defaults_section["properties"] = meaningful
 

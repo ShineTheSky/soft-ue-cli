@@ -51,6 +51,53 @@ def query_blackboard(asset_path: str) -> dict[str, Any]:
     """Read a BlackboardData asset and return clean JSON."""
     from .__main__ import _run_tool
 
+    script = textwrap.dedent(f"""\
+    import json
+    import unreal
+
+    bb = unreal.load_asset({asset_path!r})
+    if not bb:
+        raise RuntimeError("BlackboardData not found: {asset_path}")
+
+    parent = bb.get_editor_property("Parent")
+    keys = []
+    for entry in bb.get_editor_property("Keys"):
+        key_type = entry.get_editor_property("KeyType")
+        if not key_type:
+            continue
+        cls_name = key_type.get_class().get_name()
+        short_type = cls_name.replace("BlackboardKeyType_", "")
+        item = {{
+            "name": str(entry.get_editor_property("EntryName")),
+            "type": short_type,
+        }}
+        if cls_name == "BlackboardKeyType_Enum":
+            enum_type = key_type.get_editor_property("EnumType")
+            enum_name = key_type.get_editor_property("EnumName")
+            if enum_type:
+                item["enum_path"] = enum_type.get_path_name()
+            if enum_name:
+                item["enum_name"] = enum_name
+        keys.append(item)
+
+    payload = {{
+        "name": bb.get_name(),
+        "path": {asset_path!r},
+        "parent": parent.get_path_name() if parent else None,
+        "keys": keys,
+        "key_count": len(keys),
+    }}
+    print("__BB_JSON__" + json.dumps(payload, ensure_ascii=False))
+    """)
+
+    py_result = _run_tool("run-python-script", {"script": script})
+    output = py_result.get("output", "") if isinstance(py_result, dict) else ""
+    for line in reversed(output.splitlines()):
+        line = line.strip()
+        if line.startswith("__BB_JSON__"):
+            return json.loads(line[len("__BB_JSON__"):])
+
+    # Fallback to the older asset-text parser if Python output was unavailable.
     result = _run_tool("query-asset", {"asset_path": asset_path})
 
     name = result.get("name", "")
@@ -91,7 +138,8 @@ def _build_keys_script(
     The asset must already exist (created via ``create-asset``). This script
     loads it, creates key type subobjects, and saves.
     """
-    # Build key definition lines
+    # Build key definition lines. Enum keys may include enum_path/enum_type/enum
+    # for Blueprint/UserDefinedEnum assets, or enum_name for native enums.
     key_lines: list[str] = []
     for k in keys:
         name = k.get("name", "")
@@ -99,7 +147,18 @@ def _build_keys_script(
         ue_cls = _TYPE_MAP.get(ktype, "")
         if not name or not ue_cls:
             continue
-        key_lines.append(f'        ("{name}", "{ue_cls}"),')
+        enum_path = (
+            k.get("enum_path")
+            or k.get("enum_type")
+            or k.get("enum")
+            or k.get("sub_type")
+            or ""
+        )
+        enum_name = k.get("enum_name") or k.get("native_enum_name") or ""
+        key_lines.append(
+            f'        {{"name": {name!r}, "type_cls": {ue_cls!r}, '
+            f'"enum_path": {enum_path!r}, "enum_name": {enum_name!r}}},'
+        )
 
     # Parent setter
     parent_block = ""
@@ -128,7 +187,9 @@ def _build_keys_script(
     {textwrap.indent(parent_block.strip(), "    ").strip()}
 
     entries = []
-    for _name, _type_cls in _key_defs:
+    for _def in _key_defs:
+        _name = _def.get("name", "")
+        _type_cls = _def.get("type_cls", "")
         ktc = unreal.load_class(None, "/Script/AIModule." + _type_cls)
         if not ktc:
             print("WARNING: class not found:", _type_cls)
@@ -136,6 +197,17 @@ def _build_keys_script(
         entry = unreal.BlackboardEntry()
         entry.set_editor_property("EntryName", _name)
         kt = unreal.new_object(ktc, bb)
+        if _type_cls == "BlackboardKeyType_Enum":
+            _enum_path = _def.get("enum_path", "")
+            _enum_name = _def.get("enum_name", "")
+            if _enum_path:
+                _enum = unreal.load_asset(_enum_path)
+                if _enum:
+                    kt.set_editor_property("EnumType", _enum)
+                else:
+                    print("WARNING: enum asset not found for key", _name, ":", _enum_path)
+            if _enum_name:
+                kt.set_editor_property("EnumName", _enum_name)
         entry.set_editor_property("KeyType", kt)
         entries.append(entry)
 
